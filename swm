@@ -1,0 +1,669 @@
+#!/bin/zsh
+# Soloterm Worktree Manager
+set -euo pipefail
+
+usage() {
+  print -u2 "Usage: swm [--with-env] [worktree-name] [branch-from] [repository]"
+  print -u2 "       swm manage [repository]"
+  print -u2 "       swm remove <worktree-name> [--yes]"
+  print -u2 "       swm help"
+  print -u2 "Example: swm billing-redesign dev"
+  print -u2 "Example: swm billing-redesign dev --with-env"
+  print -u2 "Example: swm billing-redesign main /path/to/repository"
+  print -u2 "Example: swm remove billing-redesign"
+  print -u2 "Run swm with no arguments for interactive prompts."
+}
+
+help_page() {
+  print -r -- "Soloterm Worktree Manager — manage Git worktrees in Solo and Laravel Herd"
+  print
+  print -r -- "CREATE"
+  print -r -- "  swm"
+  print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env]"
+  print
+  print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
+  print -r -- "  becomes the folder and Herd site name."
+  print
+  print -r -- "  <branch-from> may be a branch, tag, commit, or explicit ref. Simple"
+  print -r -- "  branch names such as main or dev refresh and prefer origin/<name>."
+  print
+  print -r -- "  [repository] defaults to the Git repository containing the current"
+  print -r -- "  directory."
+  print
+  print -r -- "MANAGE"
+  print -r -- "  swm manage [repository]"
+  print
+  print -r -- "  Show an interactive list of the repository's current worktrees. Pick"
+  print -r -- "  one to fork its exact HEAD into a new Herd/Solo worktree, optionally"
+  print -r -- "  copying its .env, or remove a worktree managed under SWM_ROOT."
+  print -r -- "  Main and externally managed worktrees can be forked but not removed."
+  print
+  print -r -- "OPTIONS"
+  print -r -- "  --with-env"
+  print -r -- "      Copy the source repository's ignored .env into the new worktree."
+  print -r -- "      APP_NAME is set to the Herd site name and APP_URL is set to the"
+  print -r -- "      generated local URL. Tracked or non-ignored .env files are refused."
+  print
+  print -r -- "REMOVE"
+  print -r -- "  swm remove <worktree-name>"
+  print -r -- "  swm rm <worktree-name> --yes"
+  print
+  print -r -- "  Stops and removes the matching Solo project, then removes the linked"
+  print -r -- "  Git worktree. Dirty worktrees and non-worktree directories are refused."
+  print -r -- "  The Git branch is preserved. --yes skips the confirmation prompt."
+  print
+  print -r -- "PATHS"
+  print -r -- "  Worktrees default to: \$HOME/Herd/<site-name>"
+  print -r -- "  Override the parked root with: SWM_ROOT=/another/path"
+  print
+  print -r -- "EXAMPLES"
+  print -r -- "  swm checkout-redesign dev --with-env"
+  print -r -- "  swm api-fix main /path/to/project"
+  print -r -- "  swm manage"
+  print -r -- "  swm remove checkout-redesign"
+  print
+  print -r -- "REQUIREMENTS"
+  print -r -- "  macOS, Zsh, Git, jq, Laravel Herd, Solo, and Solo's local HTTP API."
+}
+
+site_slug() {
+  print -r -- "$1" \
+    | tr '[:upper:]_/' '[:lower:]--' \
+    | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//'
+}
+
+repository_name() {
+  local repo_path="$1"
+  local common_git_dir="$(
+    cd "$repo_path"
+    cd "$(git rev-parse --git-common-dir)"
+    pwd -P
+  )"
+
+  if [[ "${common_git_dir:t}" == ".git" ]]; then
+    print -r -- "${common_git_dir:h:t}"
+  else
+    print -r -- "${repo_path:t}"
+  fi
+}
+
+set_env_value() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  local original_mode="$(stat -f '%Lp' "$env_file")"
+  local temp_root="${TMPDIR:-/tmp}"
+  local temp_file="$(mktemp "${temp_root%/}/swm-env.XXXXXX")"
+
+  if ! awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    $0 ~ ("^" key "=") {
+      if (!found) {
+        print key "=" value
+        found = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        print key "=" value
+      }
+    }
+  ' "$env_file" > "$temp_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+
+  if ! chmod "$original_mode" "$temp_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+
+  if ! mv -f -- "$temp_file" "$env_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+remove_worktree() {
+  local requested_name="${1:-}"
+  local confirmation_flag="${2:-}"
+  local worktree_root="${SWM_ROOT:-$HOME/Herd}"
+
+  if [[ -z "$requested_name" ]]; then
+    print -u2 "Usage: swm remove <worktree-name> [--yes]"
+    return 2
+  fi
+
+  if [[ -n "$confirmation_flag" && "$confirmation_flag" != "--yes" ]]; then
+    print -u2 "Unknown option: $confirmation_flag"
+    print -u2 "Usage: swm remove <worktree-name> [--yes]"
+    return 2
+  fi
+
+  local site_name="$(site_slug "$requested_name")"
+  if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
+    print -u2 "Invalid worktree name: $requested_name"
+    return 1
+  fi
+
+  local canonical_root="${worktree_root:A}"
+  local worktree_path="${canonical_root}/${site_name}"
+
+  solo status >/dev/null
+
+  if ! command -v jq >/dev/null; then
+    print -u2 "jq is required to find the matching Solo project."
+    return 1
+  fi
+
+  local projects_json="$(solo projects list --json)"
+  local project_ids=("${(@f)$(
+    print -r -- "$projects_json" \
+      | jq -r --arg path "$worktree_path" \
+          '.data.projects[] | select((.path | rtrimstr("/")) == $path) | .id'
+  )}")
+  local project_id=""
+
+  # An empty command substitution becomes one empty array item in zsh.
+  if (( ${#project_ids} == 1 )) && [[ -z "${project_ids[1]}" ]]; then
+    project_ids=()
+  fi
+
+  if (( ${#project_ids} > 1 )); then
+    print -u2 "Multiple Solo projects unexpectedly match: $worktree_path"
+    return 1
+  elif (( ${#project_ids} == 1 )); then
+    project_id="${project_ids[1]}"
+  fi
+
+  local branch_name=""
+  local common_git_dir=""
+
+  if [[ -e "$worktree_path" ]]; then
+    if [[ ! -d "$worktree_path" || ! -f "$worktree_path/.git" ]]; then
+      print -u2 "Refusing to remove a path that is not a linked Git worktree:"
+      print -u2 "  $worktree_path"
+      return 1
+    fi
+
+    local actual_top="$(
+      git -C "$worktree_path" rev-parse --show-toplevel 2>/dev/null
+    )"
+    actual_top="${actual_top:A}"
+
+    if [[ "$actual_top" != "$worktree_path" ]]; then
+      print -u2 "Refusing to remove an unexpected Git directory:"
+      print -u2 "  $worktree_path"
+      return 1
+    fi
+
+    local dirty_state="$(
+      git -C "$worktree_path" status --porcelain --untracked-files=normal
+    )"
+    if [[ -n "$dirty_state" ]]; then
+      print -u2 "Worktree has uncommitted or untracked files; nothing was removed:"
+      print -u2 "$dirty_state"
+      return 1
+    fi
+
+    branch_name="$(
+      git -C "$worktree_path" symbolic-ref --quiet --short HEAD \
+        2>/dev/null || print -r -- "(detached HEAD)"
+    )"
+
+    common_git_dir="$(
+      cd "$worktree_path"
+      cd "$(git rev-parse --git-common-dir)"
+      pwd -P
+    )"
+  elif [[ -z "$project_id" ]]; then
+    print -u2 "No Herd worktree or Solo project found for: $requested_name"
+    return 1
+  fi
+
+  print "Cleanup target:"
+  print "  Path:    $worktree_path"
+  [[ -n "$branch_name" ]] && print "  Branch:  $branch_name (branch will be kept)"
+  if [[ -n "$project_id" ]]; then
+    print "  Solo:    project $project_id"
+  else
+    print "  Solo:    already removed"
+  fi
+
+  if [[ "$confirmation_flag" != "--yes" ]]; then
+    local answer=""
+    read "answer?Remove this worktree folder and its Solo project? [y/N]: "
+    if [[ "${answer:l}" != "y" && "${answer:l}" != "yes" ]]; then
+      print "Cancelled."
+      return 0
+    fi
+  fi
+
+  # Stop Solo-managed processes before removing the directory they use.
+  if [[ -n "$project_id" ]]; then
+    solo projects delete "$project_id" --confirm-stop-running
+  fi
+
+  if [[ -e "$worktree_path" ]]; then
+    if ! git --git-dir="$common_git_dir" worktree remove "$worktree_path"; then
+      print -u2 "Solo was removed, but Git could not remove the worktree."
+      print -u2 "Resolve the Git error, then run this command again."
+      return 1
+    fi
+  fi
+
+  print
+  print "Cleanup complete:"
+  print "  Removed: $worktree_path"
+  [[ -n "$branch_name" ]] && print "  Kept branch: $branch_name"
+}
+
+manage_worktrees() {
+  local repo_input="${1:-.}"
+  local repo=""
+
+  if ! repo="$(git -C "$repo_input" rev-parse --show-toplevel 2>/dev/null)"; then
+    print -u2 "swm manage must run inside a Git repository, or receive one:"
+    print -u2 "  swm manage /path/to/repository"
+    return 1
+  fi
+
+  if ! command -v jq >/dev/null; then
+    print -u2 "jq is required for manage mode."
+    return 1
+  fi
+
+  solo status >/dev/null
+
+  local projects_json="$(solo projects list --json)"
+  local worktree_root="${SWM_ROOT:-$HOME/Herd}"
+  local canonical_root="${worktree_root:A}"
+  local -a worktree_paths worktree_heads worktree_branches worktree_kinds
+  worktree_paths=()
+  worktree_heads=()
+  worktree_branches=()
+  worktree_kinds=()
+
+  local token=""
+  local current_path=""
+  local current_head=""
+  local current_branch=""
+
+  while IFS= read -r -d $'\0' token; do
+    case "$token" in
+      "worktree "*)
+        current_path="${token#worktree }"
+        ;;
+      "HEAD "*)
+        current_head="${token#HEAD }"
+        ;;
+      "branch refs/heads/"*)
+        current_branch="${token#branch refs/heads/}"
+        ;;
+      "detached")
+        current_branch="(detached)"
+        ;;
+      "")
+        if [[ -n "$current_path" ]]; then
+          worktree_paths+=("${current_path:A}")
+          worktree_heads+=("$current_head")
+          worktree_branches+=("${current_branch:-"(unknown)"}")
+        fi
+        current_path=""
+        current_head=""
+        current_branch=""
+        ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain -z)
+
+  if (( ${#worktree_paths} == 0 )); then
+    print -u2 "No worktrees found."
+    return 1
+  fi
+
+  local main_path="${worktree_paths[1]}"
+  local index=0
+  local actual_path=""
+  local kind=""
+  local solo_label=""
+  local short_head=""
+
+  print "Worktrees for ${main_path:t}:"
+  print
+  printf "  %2s  %-28s  %-8s  %-6s  %s\n" "#" "BRANCH" "TYPE" "SOLO" "PATH"
+
+  for (( index = 1; index <= ${#worktree_paths}; ++index )); do
+    actual_path="${worktree_paths[$index]}"
+
+    if [[ "$actual_path" == "$main_path" ]]; then
+      kind="main"
+    elif [[ "$actual_path" == "$canonical_root"/* ]]; then
+      kind="Herd"
+    else
+      kind="external"
+    fi
+    worktree_kinds+=("$kind")
+
+    if print -r -- "$projects_json" \
+      | jq -e --arg path "$actual_path" \
+          '.data.projects[] | select((.path | rtrimstr("/")) == $path)' \
+          >/dev/null; then
+      solo_label="yes"
+    else
+      solo_label="no"
+    fi
+
+    short_head="${worktree_heads[$index]:0:8}"
+    if [[ "${worktree_branches[$index]}" == "(detached)" ]]; then
+      worktree_branches[$index]="detached@$short_head"
+    fi
+
+    printf "  %2d) %-28s  %-8s  %-6s  %s\n" \
+      "$index" \
+      "${worktree_branches[$index]}" \
+      "$kind" \
+      "$solo_label" \
+      "$actual_path"
+  done
+
+  print
+  local selection=""
+  read "selection?Select a worktree [1-${#worktree_paths}, q]: "
+  if [[ "${selection:l}" == "q" || -z "$selection" ]]; then
+    print "Cancelled."
+    return 0
+  fi
+
+  if [[ "$selection" != <-> ]]; then
+    print -u2 "Invalid selection: $selection"
+    return 2
+  fi
+
+  local selected_index=$(( 10#$selection ))
+  if (( selected_index < 1 || selected_index > ${#worktree_paths} )); then
+    print -u2 "Selection is out of range: $selection"
+    return 2
+  fi
+
+  local selected_path="${worktree_paths[$selected_index]}"
+  local selected_head="${worktree_heads[$selected_index]}"
+  local selected_branch="${worktree_branches[$selected_index]}"
+  local selected_kind="${worktree_kinds[$selected_index]}"
+
+  print
+  print "Selected: $selected_branch"
+  print "  $selected_path"
+  print
+  local action=""
+  read "action?Action: [f]ork into a new worktree, [r]emove, [q]uit: "
+
+  case "${action:l}" in
+    f|fork)
+      local new_name=""
+      read "new_name?New worktree / branch name: "
+      if [[ -z "$new_name" ]]; then
+        print -u2 "A new worktree name is required."
+        return 2
+      fi
+
+      local -a create_command
+      create_command=("$new_name" "$selected_head" "$selected_path")
+
+      if [[ -f "$selected_path/.env" ]]; then
+        local copy_env=""
+        read "copy_env?Copy .env and update it for the new Herd URL? [y/N]: "
+        if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
+          create_command+=("--with-env")
+        fi
+      fi
+
+      print
+      local swm_executable="${commands[swm]:-$0}"
+      "$swm_executable" "${create_command[@]}"
+      ;;
+    r|remove)
+      if [[ "$selected_kind" != "Herd" ]]; then
+        print -u2 "Only worktrees directly managed under $canonical_root can be removed."
+        print -u2 "This '$selected_kind' worktree may still be used as a fork source."
+        return 1
+      fi
+
+      remove_worktree "${selected_path:t}" ""
+      ;;
+    q|quit|"")
+      print "Cancelled."
+      ;;
+    *)
+      print -u2 "Unknown action: $action"
+      return 2
+      ;;
+  esac
+}
+
+if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  help_page
+  exit 0
+fi
+
+if [[ "${1:-}" == "manage" ]]; then
+  if [[ "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
+    help_page
+    exit 0
+  fi
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm manage [repository]"
+    exit 2
+  fi
+  manage_worktrees "${2:-.}"
+  exit $?
+fi
+
+if [[ "${1:-}" == "remove" || "${1:-}" == "rm" ]]; then
+  if (( $# > 3 )); then
+    print -u2 "Usage: swm remove <worktree-name> [--yes]"
+    exit 2
+  fi
+  remove_worktree "${2:-}" "${3:-}"
+  exit $?
+fi
+
+with_env=false
+typeset -a create_args
+create_args=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --with-env)
+      with_env=true
+      ;;
+    -*)
+      print -u2 "Unknown option: $arg"
+      usage
+      exit 2
+      ;;
+    *)
+      create_args+=("$arg")
+      ;;
+  esac
+done
+
+if (( ${#create_args} > 3 )); then
+  usage
+  exit 2
+fi
+
+worktree_name="${create_args[1]:-}"
+branch_from="${create_args[2]:-}"
+repo_input="${create_args[3]:-.}"
+
+repo="$(git -C "$repo_input" rev-parse --show-toplevel)"
+
+source_env="${repo}/.env"
+if [[ "$with_env" == true ]]; then
+  if [[ ! -f "$source_env" || ! -r "$source_env" ]]; then
+    print -u2 "Cannot use --with-env because the source .env is missing or unreadable:"
+    print -u2 "  $source_env"
+    exit 1
+  fi
+
+  if git -C "$repo" ls-files --error-unmatch .env >/dev/null 2>&1; then
+    print -u2 "Refusing --with-env because .env is tracked by Git."
+    print -u2 "This option is intended for ignored, machine-local Laravel .env files."
+    exit 1
+  fi
+
+  if ! git -C "$repo" check-ignore -q -- .env; then
+    print -u2 "Refusing --with-env because .env is not ignored by Git."
+    print -u2 "Add .env to the repository's .gitignore before using this option."
+    exit 1
+  fi
+fi
+
+default_branch_from="$(
+  git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD \
+    2>/dev/null | sed 's#^origin/##' || true
+)"
+default_branch_from="${default_branch_from:-HEAD}"
+
+if [[ -z "$worktree_name" ]]; then
+  read "worktree_name?Worktree / new branch name: "
+fi
+
+if [[ -z "$branch_from" ]]; then
+  read "branch_from?Branch from [$default_branch_from]: "
+  branch_from="${branch_from:-$default_branch_from}"
+fi
+
+if [[ -z "$worktree_name" || -z "$branch_from" ]]; then
+  print -u2 "Both the worktree name and branch-from value are required."
+  exit 2
+fi
+
+# The requested worktree name is also the new Git branch name.
+new_branch="$worktree_name"
+git -C "$repo" check-ref-format --branch "$new_branch" >/dev/null
+
+if git -C "$repo" show-ref --verify --quiet "refs/heads/$new_branch"; then
+  print -u2 "Local branch already exists: $new_branch"
+  print -u2 "Choose a new worktree name/branch."
+  exit 1
+fi
+
+if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$new_branch"; then
+  print -u2 "Remote branch already exists: origin/$new_branch"
+  print -u2 "Choose a new worktree name/branch."
+  exit 1
+fi
+
+# Herd derives the local hostname from the immediate directory name.
+site_name="$(site_slug "$worktree_name")"
+
+if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
+  print -u2 "The worktree name must produce a non-empty DNS label of at most 63 characters."
+  exit 1
+fi
+
+worktree_root="${SWM_ROOT:-$HOME/Herd}"
+worktree_path="${worktree_root}/${site_name}"
+
+if [[ -e "$worktree_path" ]]; then
+  print -u2 "Destination already exists: $worktree_path"
+  exit 1
+fi
+
+# Refresh simple origin branch names so "dev" and "main" use the latest
+# remote-tracking commit. If fetching is unavailable, fall back to the cached
+# ref and say so.
+if [[ "$branch_from" != */* ]] \
+  && [[ ! "$branch_from" =~ ^[0-9a-fA-F]{7,64}$ ]] \
+  && git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+  print "Refreshing origin/$branch_from…"
+  if ! git -C "$repo" fetch --quiet origin "$branch_from"; then
+    print -u2 "Warning: fetch failed; using the currently available ref."
+  fi
+fi
+
+# Prefer a named remote branch when both origin/dev and a local dev exist.
+# Explicit refs such as origin/dev, tags, and commit SHAs are used as written.
+if [[ "$branch_from" != */* ]] \
+  && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch_from"; then
+  start_point="origin/$branch_from"
+elif git -C "$repo" rev-parse --verify --quiet "${branch_from}^{commit}" >/dev/null; then
+  start_point="$branch_from"
+elif git -C "$repo" rev-parse --verify --quiet "origin/${branch_from}^{commit}" >/dev/null; then
+  start_point="origin/$branch_from"
+else
+  print -u2 "Cannot find branch-from ref: $branch_from"
+  print -u2 "Try git fetch first, or pass an explicit ref such as origin/main."
+  exit 1
+fi
+
+# Check Solo before changing the repository so a disabled API cannot leave a
+# newly created worktree waiting to be imported.
+solo status >/dev/null
+
+if ! command -v herd >/dev/null; then
+  print -u2 "Laravel Herd's CLI is not available."
+  exit 1
+fi
+
+if ! command -v jq >/dev/null; then
+  print -u2 "jq is required to verify Laravel Herd's parked paths."
+  exit 1
+fi
+
+tld="$(herd tld)"
+site_url="http://${site_name}.${tld}"
+
+mkdir -p -- "$worktree_root"
+
+# Keep custom SWM_ROOT locations working by parking them once when necessary.
+canonical_root="${worktree_root:A}"
+if ! herd paths \
+  | jq -e --arg root "$canonical_root" \
+      'map(rtrimstr("/")) | index($root) != null' >/dev/null; then
+  herd park "$canonical_root"
+fi
+
+print "Creating branch '$new_branch' from '$start_point'…"
+git -C "$repo" worktree add -b "$new_branch" "$worktree_path" "$start_point"
+
+if [[ "$with_env" == true ]]; then
+  destination_env="${worktree_path}/.env"
+
+  if ! git -C "$worktree_path" check-ignore -q -- .env; then
+    print -u2 "Worktree created, but its target branch does not ignore .env."
+    print -u2 "No environment file was copied and the project was not added to Solo."
+    print -u2 "Clean up with: swm remove '$worktree_name'"
+    exit 1
+  fi
+
+  if [[ -e "$destination_env" ]]; then
+    print -u2 "Worktree created, but its .env already exists; it was not overwritten:"
+    print -u2 "  $destination_env"
+    exit 1
+  fi
+
+  /bin/cp -p "$source_env" "$destination_env"
+  set_env_value "$destination_env" "APP_NAME" "\"${site_name}\""
+  set_env_value "$destination_env" "APP_URL" "$site_url"
+fi
+
+repo_name="$(repository_name "$repo")"
+if ! solo projects create "${repo_name}: ${new_branch}" "$worktree_path"; then
+  print -u2 "Worktree created, but Solo import failed."
+  print -u2 "Retry with: solo projects create '${repo_name}: ${new_branch}' '$worktree_path'"
+  exit 1
+fi
+
+print
+print "Created and added to Solo:"
+print "  Branch:  $new_branch"
+print "  From:    $start_point"
+print "  Path:    $worktree_path"
+print "  URL:     $site_url"
+if [[ "$with_env" == true ]]; then
+  print "  Env:     copied; APP_NAME and APP_URL updated"
+fi
