@@ -1,7 +1,24 @@
 # Soloterm Worktree Manager
 
-`swm` creates and cleans up Git worktrees that are automatically registered
-with [Solo](https://soloterm.com) and served by [Laravel Herd](https://herd.laravel.com).
+`swm` turns a branch into an isolated, ready-to-use local development
+environment with one command. It is for developers who want to work on
+multiple features at once without repeatedly setting up folders, local
+domains, environment files, and Solo projects by hand.
+
+When you create a worktree, `swm`:
+
+1. Creates a new Git branch and linked worktree from `main`, `dev`, another
+   branch, a tag, or a commit.
+2. Places it under `$HOME/Herd` so [Laravel Herd](https://herd.laravel.com)
+   automatically serves it at `http://<worktree-name>.test`.
+3. Optionally copies the source project's ignored `.env`, then updates
+   `APP_NAME` and `APP_URL` for the new Herd site.
+4. Registers the worktree as a separate project in
+   [Solo](https://soloterm.com), ready for its own commands, terminals, and
+   agents.
+
+It also provides an interactive manager for forking existing worktrees and
+cleanly removing Herd/Solo worktrees when they are no longer needed.
 
 ## Requirements
 
