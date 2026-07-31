@@ -94,6 +94,28 @@ swm
 `swm manage` is the explicit equivalent. With no repository argument, manage
 mode automatically uses the Git repository containing your current directory.
 
+## Adding an existing worktree to Solo
+
+Manage mode lists every worktree in the repository and whether each is already
+a Solo project:
+
+```
+  #  BRANCH                        TYPE      SOLO    PATH
+  1) main                          main      yes     /Users/you/Code/myapp
+  2) billing-redesign              managed   yes     /Users/you/Herd/billing-redesign
+  3) hotfix                        external  no      /Users/you/scratch/hotfix
+
+1 worktree(s) not in Solo. Select one to add it.
+```
+
+Pick one showing `SOLO no` and choose `[a]dd to Solo`. This registers the
+existing directory only — it does not create a branch, copy a `.env`, or move
+anything. The project is named `<repo>: <branch>`, matching what worktree
+creation would have used.
+
+Useful for worktrees made with plain `git worktree add`, or ones whose Solo
+project was deleted.
+
 ## Remembering the .env choice
 
 When you fork a worktree whose source has a `.env`, `swm` asks whether to copy

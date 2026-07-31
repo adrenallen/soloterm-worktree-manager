@@ -2,7 +2,7 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.2.0"
+SWM_VERSION="1.3.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -45,10 +45,16 @@ help_page() {
   print -r -- "  swm"
   print -r -- "  swm manage [repository]"
   print
-  print -r -- "  Show an interactive list of the repository's current worktrees. Pick"
-  print -r -- "  one to fork its exact HEAD into a new managed worktree, optionally"
-  print -r -- "  copying its .env, or remove a worktree managed under SWM_ROOT."
+  print -r -- "  Show an interactive list of the repository's current worktrees, and"
+  print -r -- "  whether each one is already a Solo project. Pick one to fork its"
+  print -r -- "  exact HEAD into a new managed worktree, optionally copying its"
+  print -r -- "  .env, or remove a worktree managed under SWM_ROOT."
   print -r -- "  Main and externally managed worktrees can be forked but not removed."
+  print
+  print -r -- "  A worktree listed as SOLO 'no' can be added to Solo as a project."
+  print -r -- "  Adding registers the existing directory only: no branch is created"
+  print -r -- "  and no .env is copied. The project is named \"<repo>: <branch>\","
+  print -r -- "  matching what worktree creation would have used."
   print
   print -r -- "OPTIONS"
   print -r -- "  --with-env"
@@ -408,6 +414,14 @@ has_herd() {
   command -v herd >/dev/null
 }
 
+# Herd only serves a directory whose parent is parked, so a generated URL is
+# only real once this is true. Requires jq.
+herd_path_is_parked() {
+  herd paths \
+    | jq -e --arg root "$1" \
+        'map(rtrimstr("/")) | index($root) != null' >/dev/null
+}
+
 # Herd users keep the parked $HOME/Herd default. Without Herd, fall back to a
 # neutral directory, but keep using an existing $HOME/Herd so worktrees created
 # while Herd was installed stay visible after it is removed.
@@ -674,10 +688,12 @@ manage_worktrees() {
   local worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
   local -a worktree_paths worktree_heads worktree_branches worktree_kinds
+  local -a worktree_in_solo
   worktree_paths=()
   worktree_heads=()
   worktree_branches=()
   worktree_kinds=()
+  worktree_in_solo=()
 
   local token=""
   local current_path=""
@@ -747,6 +763,7 @@ manage_worktrees() {
     else
       solo_label="no"
     fi
+    worktree_in_solo+=("$solo_label")
 
     short_head="${worktree_heads[$index]:0:8}"
     if [[ "${worktree_branches[$index]}" == "(detached)" ]]; then
@@ -761,7 +778,15 @@ manage_worktrees() {
       "$actual_path"
   done
 
+  local -a missing_from_solo
+  missing_from_solo=("${(@)worktree_in_solo:#yes}")
+
   print
+  if (( ${#missing_from_solo} > 0 )); then
+    print "${#missing_from_solo} worktree(s) not in Solo. Select one to add it."
+    print
+  fi
+
   local selection=""
   read "selection?Select a worktree [1-${#worktree_paths}, q]: "
   if [[ "${selection:l}" == "q" || -z "$selection" ]]; then
@@ -784,13 +809,19 @@ manage_worktrees() {
   local selected_head="${worktree_heads[$selected_index]}"
   local selected_branch="${worktree_branches[$selected_index]}"
   local selected_kind="${worktree_kinds[$selected_index]}"
+  local selected_in_solo="${worktree_in_solo[$selected_index]}"
 
   print
   print "Selected: $selected_branch"
-  print "  $selected_path"
+  print "  Path: $selected_path"
+  print "  Solo: $selected_in_solo"
   print
   local action=""
-  read "action?Action: [f]ork into a new worktree, [r]emove, [q]uit: "
+  if [[ "$selected_in_solo" == "no" ]]; then
+    read "action?Action: [f]ork into a new worktree, [a]dd to Solo, [r]emove, [q]uit: "
+  else
+    read "action?Action: [f]ork into a new worktree, [r]emove, [q]uit: "
+  fi
 
   case "${action:l}" in
     f|fork)
@@ -840,6 +871,35 @@ manage_worktrees() {
       local swm_executable="${commands[swm]:-$SWM_SCRIPT}"
       # This run already reported any available update.
       SWM_NO_UPDATE_CHECK=1 "$swm_executable" "${create_command[@]}"
+      ;;
+    a|add)
+      if [[ "$selected_in_solo" == "yes" ]]; then
+        print -u2 "This worktree is already a Solo project."
+        return 1
+      fi
+
+      # Register the existing worktree as-is. Nothing in it is created or
+      # modified, so no branch is made and no .env is copied.
+      local existing_name="$(repository_name "$selected_path")"
+      local project_label="${existing_name}: ${selected_branch}"
+
+      if ! solo projects create "$project_label" "$selected_path"; then
+        print -u2 "Solo import failed."
+        print -u2 "Retry with: solo projects create '$project_label' '$selected_path'"
+        return 1
+      fi
+
+      print
+      print "Added to Solo:"
+      print "  Name:    $project_label"
+      print "  Branch:  $selected_branch"
+      print "  Path:    $selected_path"
+      # Adding does not park anything, so only advertise a URL that Herd is
+      # actually serving.
+      if has_herd && [[ "$selected_path" == "$canonical_root"/* ]] \
+        && herd_path_is_parked "$canonical_root"; then
+        print "  URL:     http://${selected_path:t}.$(herd tld)"
+      fi
       ;;
     r|remove)
       if [[ "$selected_kind" != "managed" ]]; then
@@ -1068,9 +1128,7 @@ if has_herd; then
   site_url="http://${site_name}.${tld}"
 
   # Keep custom SWM_ROOT locations working by parking them once when necessary.
-  if ! herd paths \
-    | jq -e --arg root "$canonical_root" \
-        'map(rtrimstr("/")) | index($root) != null' >/dev/null; then
+  if ! herd_path_is_parked "$canonical_root"; then
     herd park "$canonical_root"
   fi
 fi
