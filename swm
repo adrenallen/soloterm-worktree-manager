@@ -3,7 +3,8 @@
 set -euo pipefail
 
 usage() {
-  print -u2 "Usage: swm [--with-env] [worktree-name] [branch-from] [repository]"
+  print -u2 "Usage: swm"
+  print -u2 "       swm [--with-env] <worktree-name> <branch-from> [repository]"
   print -u2 "       swm manage [repository]"
   print -u2 "       swm remove <worktree-name> [--yes]"
   print -u2 "       swm help"
@@ -11,14 +12,13 @@ usage() {
   print -u2 "Example: swm billing-redesign dev --with-env"
   print -u2 "Example: swm billing-redesign main /path/to/repository"
   print -u2 "Example: swm remove billing-redesign"
-  print -u2 "Run swm with no arguments for interactive prompts."
+  print -u2 "Run swm with no arguments for manage mode."
 }
 
 help_page() {
   print -r -- "Soloterm Worktree Manager — manage Git worktrees in Solo and Laravel Herd"
   print
   print -r -- "CREATE"
-  print -r -- "  swm"
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env]"
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
@@ -31,6 +31,7 @@ help_page() {
   print -r -- "  directory."
   print
   print -r -- "MANAGE"
+  print -r -- "  swm"
   print -r -- "  swm manage [repository]"
   print
   print -r -- "  Show an interactive list of the repository's current worktrees. Pick"
@@ -49,8 +50,9 @@ help_page() {
   print -r -- "  swm rm <worktree-name> --yes"
   print
   print -r -- "  Stops and removes the matching Solo project, then removes the linked"
-  print -r -- "  Git worktree. Dirty worktrees and non-worktree directories are refused."
-  print -r -- "  The Git branch is preserved. --yes skips the confirmation prompt."
+  print -r -- "  Git worktree. Dirty worktrees can be reviewed before choosing to cancel"
+  print -r -- "  or force deletion with a typed-name confirmation. The Git branch is"
+  print -r -- "  preserved. --yes skips only the normal clean-worktree confirmation."
   print
   print -r -- "PATHS"
   print -r -- "  Worktrees default to: \$HOME/Herd/<site-name>"
@@ -180,6 +182,7 @@ remove_worktree() {
 
   local branch_name=""
   local common_git_dir=""
+  local delete_dirty=false
 
   if [[ -e "$worktree_path" ]]; then
     if [[ ! -d "$worktree_path" || ! -f "$worktree_path/.git" ]]; then
@@ -200,12 +203,53 @@ remove_worktree() {
     fi
 
     local dirty_state="$(
-      git -C "$worktree_path" status --porcelain --untracked-files=normal
+      git -C "$worktree_path" status --porcelain --untracked-files=all
     )"
     if [[ -n "$dirty_state" ]]; then
-      print -u2 "Worktree has uncommitted or untracked files; nothing was removed:"
-      print -u2 "$dirty_state"
-      return 1
+      local -a dirty_files
+      dirty_files=("${(@f)dirty_state}")
+      print -u2 "Worktree has ${#dirty_files} uncommitted or untracked file(s)."
+      print -u2 -- "--yes does not override this safety check."
+
+      while true; do
+        local dirty_action=""
+        if ! read "dirty_action?Action: [s]how files, [d]elete anyway, [c]ancel: "; then
+          print "Cancelled."
+          return 0
+        fi
+
+        case "${dirty_action:l}" in
+          s|show|files|"show files"|"show me the files")
+            print
+            git -C "$worktree_path" status --short --branch --untracked-files=all
+            print
+            ;;
+          d|delete|force|"delete anyway")
+            print
+            print -u2 "Warning: this permanently deletes these local changes."
+            local typed_name=""
+            if ! read "typed_name?Type '$site_name' to confirm: "; then
+              print "Cancelled."
+              return 0
+            fi
+
+            if [[ "$typed_name" != "$site_name" ]]; then
+              print "Confirmation did not match. Cancelled."
+              return 0
+            fi
+
+            delete_dirty=true
+            break
+            ;;
+          c|cancel|q|quit|"")
+            print "Cancelled."
+            return 0
+            ;;
+          *)
+            print -u2 "Choose show, delete anyway, or cancel."
+            ;;
+        esac
+      done
     fi
 
     branch_name="$(
@@ -232,7 +276,7 @@ remove_worktree() {
     print "  Solo:    already removed"
   fi
 
-  if [[ "$confirmation_flag" != "--yes" ]]; then
+  if [[ "$confirmation_flag" != "--yes" && "$delete_dirty" != true ]]; then
     local answer=""
     read "answer?Remove this worktree folder and its Solo project? [y/N]: "
     if [[ "${answer:l}" != "y" && "${answer:l}" != "yes" ]]; then
@@ -247,7 +291,9 @@ remove_worktree() {
   fi
 
   if [[ -e "$worktree_path" ]]; then
-    if ! git --git-dir="$common_git_dir" worktree remove "$worktree_path"; then
+    # Path checks plus the confirmations above make --force safe here, while
+    # still allowing expected ignored files such as .env to be removed.
+    if ! git --git-dir="$common_git_dir" worktree remove --force "$worktree_path"; then
       print -u2 "Solo was removed, but Git could not remove the worktree."
       print -u2 "Resolve the Git error, then run this command again."
       return 1
@@ -441,6 +487,11 @@ manage_worktrees() {
       ;;
   esac
 }
+
+if (( $# == 0 )); then
+  manage_worktrees "."
+  exit $?
+fi
 
 if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   help_page

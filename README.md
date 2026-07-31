@@ -60,8 +60,11 @@ swm checkout-redesign dev --with-env
 Interactively fork or remove an existing worktree:
 
 ```sh
-swm manage
+swm
 ```
+
+`swm manage` is the explicit equivalent. With no repository argument, manage
+mode automatically uses the Git repository containing your current directory.
 
 Remove a managed worktree while preserving its Git branch:
 
@@ -74,8 +77,11 @@ Worktrees default to `$HOME/Herd`. Override that parked directory with
 
 ## Safety
 
-Removal refuses dirty worktrees and directories not managed under `SWM_ROOT`.
-Environment copying requires `.env` to be untracked and Git-ignored.
+Removal refuses directories not managed under `SWM_ROOT`. If a worktree has
+uncommitted or untracked files, `swm` lets you show the file list, cancel, or
+choose “delete anyway” with a typed-name confirmation. `--yes` never silently
+authorizes deleting local changes. Environment copying requires `.env` to be
+untracked and Git-ignored.
 
 ## License
 
