@@ -116,18 +116,32 @@ creation would have used.
 Useful for worktrees made with plain `git worktree add`, or ones whose Solo
 project was deleted.
 
+Removing works the same way in reverse. For a worktree under `SWM_ROOT`,
+`[r]emove` deletes the directory and its Solo project. For a **main or external**
+worktree it offers to remove the Solo project only:
+
+```
+This 'external' worktree is not under /Users/you/Herd,
+so swm will not delete its directory or Git worktree.
+
+Remove its Solo project only, keeping all files? [y/N]:
+```
+
+The directory, Git worktree, and branch are all kept — a worktree outside
+`SWM_ROOT` is not `swm`'s to delete. Re-add it later with `[a]dd to Solo`.
+
 ## Remembering the .env choice
 
-When you fork a worktree whose source has a `.env`, `swm` asks whether to copy
-it, then offers to remember your answer for that project:
+When you create or fork a worktree whose source has a `.env`, `swm` asks
+whether to copy it, then offers to remember your answer for that project:
 
 ```
 Copy .env and update it for the new worktree? [y/N]: y
 Remember this for myapp from now on? [y/N]: y
 ```
 
-Later forks of that project apply the remembered answer without asking. Clear
-it to bring the prompt back:
+Later runs on that project apply the remembered answer without asking. Clear it
+to bring the prompt back:
 
 ```sh
 swm forget
@@ -137,9 +151,16 @@ Defaults are keyed by the project's main worktree, so every linked worktree of
 the same clone shares one setting, and `swm forget` works from inside any of
 them. They are stored in `~/.config/swm/projects.conf`.
 
-This applies to fork mode only. Direct creation still requires an explicit
-`--with-env`, so a scripted `swm` run never copies a `.env` because of saved
-state you cannot see at the call site.
+Both flags override a remembered default, and either one skips the prompt:
+
+```sh
+swm checkout-redesign dev --with-env   # always copy
+swm checkout-redesign dev --no-env     # never copy
+```
+
+The question is only asked when stdin is a terminal, so a scripted or
+cron-driven `swm` run never blocks waiting for an answer. Pass a flag
+explicitly in those contexts rather than relying on saved state.
 
 Remove a managed worktree while preserving its Git branch:
 

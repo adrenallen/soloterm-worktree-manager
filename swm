@@ -2,7 +2,7 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.3.0"
+SWM_VERSION="1.4.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -12,7 +12,7 @@ SWM_SCRIPT="${0:A}"
 
 usage() {
   print -u2 "Usage: swm"
-  print -u2 "       swm [--with-env] <worktree-name> <branch-from> [repository]"
+  print -u2 "       swm [--with-env|--no-env] <worktree-name> <branch-from> [repository]"
   print -u2 "       swm manage [repository]"
   print -u2 "       swm remove <worktree-name> [--yes]"
   print -u2 "       swm forget [repository]"
@@ -30,7 +30,7 @@ help_page() {
   print -r -- "Soloterm Worktree Manager — manage Git worktrees in Solo and Laravel Herd"
   print
   print -r -- "CREATE"
-  print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env]"
+  print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env|--no-env]"
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
   print -r -- "  becomes the folder name, and the Herd site name when Herd is present."
@@ -49,12 +49,16 @@ help_page() {
   print -r -- "  whether each one is already a Solo project. Pick one to fork its"
   print -r -- "  exact HEAD into a new managed worktree, optionally copying its"
   print -r -- "  .env, or remove a worktree managed under SWM_ROOT."
-  print -r -- "  Main and externally managed worktrees can be forked but not removed."
+  print -r -- "  Only worktrees under SWM_ROOT can be deleted outright."
   print
   print -r -- "  A worktree listed as SOLO 'no' can be added to Solo as a project."
   print -r -- "  Adding registers the existing directory only: no branch is created"
   print -r -- "  and no .env is copied. The project is named \"<repo>: <branch>\","
   print -r -- "  matching what worktree creation would have used."
+  print
+  print -r -- "  Removing a main or external worktree offers to remove its Solo"
+  print -r -- "  project only. The directory, Git worktree, and branch are kept,"
+  print -r -- "  since a worktree outside SWM_ROOT is not swm's to delete."
   print
   print -r -- "OPTIONS"
   print -r -- "  --with-env"
@@ -63,6 +67,14 @@ help_page() {
   print -r -- "      APP_URL is also set to the generated local URL; without Herd the"
   print -r -- "      copied APP_URL is left unchanged. Tracked or non-ignored .env"
   print -r -- "      files are refused."
+  print
+  print -r -- "  --no-env"
+  print -r -- "      Never copy .env, overriding any remembered project default."
+  print
+  print -r -- "  With neither flag and a .env present, swm applies the project's"
+  print -r -- "  remembered choice, or asks and offers to remember the answer. The"
+  print -r -- "  question is skipped when stdin is not a terminal, so scripted runs"
+  print -r -- "  never block; pass a flag explicitly there."
   print
   print -r -- "REMOVE"
   print -r -- "  swm remove <worktree-name>"
@@ -76,15 +88,14 @@ help_page() {
   print -r -- "PROJECT DEFAULTS"
   print -r -- "  swm forget [repository]"
   print -r -- ""
-  print -r -- "  The first time you fork a worktree whose source has a .env, swm"
-  print -r -- "  asks whether to copy it, then offers to remember the answer for"
-  print -r -- "  that project. Later forks apply the remembered answer without"
-  print -r -- "  asking. swm forget clears it so the prompt returns."
+  print -r -- "  The first time you create or fork a worktree whose source has a"
+  print -r -- "  .env, swm asks whether to copy it, then offers to remember the"
+  print -r -- "  answer for that project. Later runs apply it without asking."
+  print -r -- "  swm forget clears it so the prompt returns."
   print -r -- ""
   print -r -- "  Defaults are keyed by the project's main worktree and stored in"
-  print -r -- "  \$XDG_CONFIG_HOME/swm/projects.conf (default ~/.config/swm)."
-  print -r -- "  They apply to fork mode only; direct creation still requires an"
-  print -r -- "  explicit --with-env."
+  print -r -- "  \$XDG_CONFIG_HOME/swm/projects.conf (default ~/.config/swm), so"
+  print -r -- "  every linked worktree of one clone shares a single setting."
   print
   print -r -- "UPDATE"
   print -r -- "  swm update [--force]"
@@ -416,6 +427,32 @@ has_herd() {
 
 # Herd only serves a directory whose parent is parked, so a generated URL is
 # only real once this is true. Requires jq.
+# Print the Solo project id registered at a path. Returns 1 when there is no
+# project and 2 when more than one unexpectedly matches, so callers can tell
+# "nothing to do" apart from "refuse to guess".
+solo_project_id_for() {
+  local projects_json="$1" worktree_path="$2"
+  local -a ids
+  ids=("${(@f)$(
+    print -r -- "$projects_json" \
+      | jq -r --arg path "$worktree_path" \
+          '.data.projects[] | select((.path | rtrimstr("/")) == $path) | .id'
+  )}")
+
+  # An empty command substitution becomes one empty array item in zsh.
+  if (( ${#ids} == 1 )) && [[ -z "${ids[1]}" ]]; then
+    ids=()
+  fi
+
+  if (( ${#ids} > 1 )); then
+    print -u2 "Multiple Solo projects unexpectedly match: $worktree_path"
+    return 2
+  fi
+
+  (( ${#ids} == 1 )) || return 1
+  print -r -- "${ids[1]}"
+}
+
 herd_path_is_parked() {
   herd paths \
     | jq -e --arg root "$1" \
@@ -522,23 +559,14 @@ remove_worktree() {
   fi
 
   local projects_json="$(solo projects list --json)"
-  local project_ids=("${(@f)$(
-    print -r -- "$projects_json" \
-      | jq -r --arg path "$worktree_path" \
-          '.data.projects[] | select((.path | rtrimstr("/")) == $path) | .id'
-  )}")
   local project_id=""
+  local lookup_status=0
 
-  # An empty command substitution becomes one empty array item in zsh.
-  if (( ${#project_ids} == 1 )) && [[ -z "${project_ids[1]}" ]]; then
-    project_ids=()
-  fi
-
-  if (( ${#project_ids} > 1 )); then
-    print -u2 "Multiple Solo projects unexpectedly match: $worktree_path"
+  # Assigned separately because the local builtin would mask the exit status.
+  project_id="$(solo_project_id_for "$projects_json" "$worktree_path")" \
+    || lookup_status=$?
+  if (( lookup_status == 2 )); then
     return 1
-  elif (( ${#project_ids} == 1 )); then
-    project_id="${project_ids[1]}"
   fi
 
   local branch_name=""
@@ -843,20 +871,26 @@ manage_worktrees() {
             create_command+=("--with-env")
             print "Copying .env (remembered for ${main_path:t})."
           else
+            create_command+=("--no-env")
             print "Not copying .env (remembered for ${main_path:t})."
           fi
           print "Undo with: swm forget"
         else
           local copy_env=""
           local wants_env="no"
-          read "copy_env?Copy .env and update it for the new worktree? [y/N]: "
+          read "copy_env?Copy .env and update it for the new worktree? [y/N]: " \
+            || copy_env=""
           if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
             create_command+=("--with-env")
             wants_env="yes"
+          else
+            # Explicit, so the child create does not ask the same question.
+            create_command+=("--no-env")
           fi
 
           local remember=""
-          read "remember?Remember this for ${main_path:t} from now on? [y/N]: "
+          read "remember?Remember this for ${main_path:t} from now on? [y/N]: " \
+            || remember=""
           if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
             if set_project_default "$main_path" "fork-env" "$wants_env"; then
               print "Saved. Undo with: swm forget"
@@ -868,7 +902,9 @@ manage_worktrees() {
       fi
 
       print
-      local swm_executable="${commands[swm]:-$SWM_SCRIPT}"
+      # Re-invoke this exact script, not whatever swm is on PATH, so a
+      # different installed version cannot receive flags it does not know.
+      local swm_executable="$SWM_SCRIPT"
       # This run already reported any available update.
       SWM_NO_UPDATE_CHECK=1 "$swm_executable" "${create_command[@]}"
       ;;
@@ -902,10 +938,46 @@ manage_worktrees() {
       fi
       ;;
     r|remove)
+      # Worktrees outside SWM_ROOT are not swm's to delete, but their Solo
+      # project still is. Offer to unregister without touching anything on disk.
       if [[ "$selected_kind" != "managed" ]]; then
-        print -u2 "Only worktrees directly managed under $canonical_root can be removed."
-        print -u2 "This '$selected_kind' worktree may still be used as a fork source."
-        return 1
+        print "This '$selected_kind' worktree is not under $canonical_root,"
+        print "so swm will not delete its directory or Git worktree."
+
+        if [[ "$selected_in_solo" != "yes" ]]; then
+          print "It is not a Solo project either, so there is nothing to remove."
+          return 1
+        fi
+
+        local project_id=""
+        local lookup_status=0
+        project_id="$(solo_project_id_for "$projects_json" "$selected_path")" \
+          || lookup_status=$?
+        if (( lookup_status != 0 )); then
+          print -u2 "Could not identify the Solo project for this worktree."
+          return 1
+        fi
+
+        print
+        local unregister=""
+        read "unregister?Remove its Solo project only, keeping all files? [y/N]: " \
+          || unregister=""
+        if [[ "${unregister:l}" != "y" && "${unregister:l}" != "yes" ]]; then
+          print "Cancelled."
+          return 0
+        fi
+
+        if ! solo projects delete "$project_id" --confirm-stop-running; then
+          print -u2 "Could not remove the Solo project."
+          return 1
+        fi
+
+        print
+        print "Removed from Solo:"
+        print "  Project: $project_id"
+        print "  Path:    $selected_path"
+        print "  Kept:    directory, Git worktree, and branch"
+        return 0
       fi
 
       remove_worktree "${selected_path:t}" ""
@@ -978,6 +1050,7 @@ if [[ "${1:-}" == "remove" || "${1:-}" == "rm" ]]; then
 fi
 
 with_env=false
+without_env=false
 typeset -a create_args
 create_args=()
 
@@ -985,6 +1058,9 @@ for arg in "$@"; do
   case "$arg" in
     --with-env)
       with_env=true
+      ;;
+    --no-env)
+      without_env=true
       ;;
     -*)
       print -u2 "Unknown option: $arg"
@@ -996,6 +1072,11 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+if [[ "$with_env" == true && "$without_env" == true ]]; then
+  print -u2 -- "--with-env and --no-env cannot be combined."
+  exit 2
+fi
 
 if (( ${#create_args} > 3 )); then
   usage
@@ -1009,25 +1090,6 @@ repo_input="${create_args[3]:-.}"
 repo="$(git -C "$repo_input" rev-parse --show-toplevel)"
 
 source_env="${repo}/.env"
-if [[ "$with_env" == true ]]; then
-  if [[ ! -f "$source_env" || ! -r "$source_env" ]]; then
-    print -u2 "Cannot use --with-env because the source .env is missing or unreadable:"
-    print -u2 "  $source_env"
-    exit 1
-  fi
-
-  if git -C "$repo" ls-files --error-unmatch .env >/dev/null 2>&1; then
-    print -u2 "Refusing --with-env because .env is tracked by Git."
-    print -u2 "This option is intended for ignored, machine-local Laravel .env files."
-    exit 1
-  fi
-
-  if ! git -C "$repo" check-ignore -q -- .env; then
-    print -u2 "Refusing --with-env because .env is not ignored by Git."
-    print -u2 "Add .env to the repository's .gitignore before using this option."
-    exit 1
-  fi
-fi
 
 default_branch_from="$(
   git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD \
@@ -1047,6 +1109,66 @@ fi
 if [[ -z "$worktree_name" || -z "$branch_from" ]]; then
   print -u2 "Both the worktree name and branch-from value are required."
   exit 2
+fi
+
+# With neither flag given, apply the project's remembered choice, or ask. The
+# prompt is skipped without a terminal so cron jobs and scripts keep behaving
+# predictably; pass --with-env or --no-env to be explicit there.
+if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; then
+  project_key=""
+  if project_key="$(main_worktree_path "$repo")"; then
+    remembered_env=""
+    if remembered_env="$(project_default "$project_key" "fork-env")"; then
+      if [[ "$remembered_env" == "yes" ]]; then
+        with_env=true
+        print "Copying .env (remembered for ${project_key:t})."
+      else
+        print "Not copying .env (remembered for ${project_key:t})."
+      fi
+      print "Undo with: swm forget"
+    elif [[ -t 0 ]]; then
+      copy_env=""
+      wants_env="no"
+      # A closed stdin answers No rather than aborting the run.
+      read "copy_env?Copy .env and update it for the new worktree? [y/N]: " \
+        || copy_env=""
+      if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
+        with_env=true
+        wants_env="yes"
+      fi
+
+      remember=""
+      read "remember?Remember this for ${project_key:t} from now on? [y/N]: " \
+        || remember=""
+      if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
+        if set_project_default "$project_key" "fork-env" "$wants_env"; then
+          print "Saved. Undo with: swm forget"
+        else
+          print -u2 "Warning: could not save to $(project_defaults_file)"
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ "$with_env" == true ]]; then
+  if [[ ! -f "$source_env" || ! -r "$source_env" ]]; then
+    print -u2 "Cannot copy .env because the source is missing or unreadable:"
+    print -u2 "  $source_env"
+    exit 1
+  fi
+
+  if git -C "$repo" ls-files --error-unmatch .env >/dev/null 2>&1; then
+    print -u2 "Refusing to copy .env because it is tracked by Git."
+    print -u2 "This is intended for ignored, machine-local Laravel .env files."
+    exit 1
+  fi
+
+  if ! git -C "$repo" check-ignore -q -- .env; then
+    print -u2 "Refusing to copy .env because it is not ignored by Git."
+    print -u2 "Add .env to the repository's .gitignore first."
+    exit 1
+  fi
 fi
 
 # The requested worktree name is also the new Git branch name.
