@@ -2,7 +2,7 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.1.0"
+SWM_VERSION="1.2.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -15,6 +15,7 @@ usage() {
   print -u2 "       swm [--with-env] <worktree-name> <branch-from> [repository]"
   print -u2 "       swm manage [repository]"
   print -u2 "       swm remove <worktree-name> [--yes]"
+  print -u2 "       swm forget [repository]"
   print -u2 "       swm update [--force]"
   print -u2 "       swm version"
   print -u2 "       swm help"
@@ -65,6 +66,19 @@ help_page() {
   print -r -- "  Git worktree. Dirty worktrees can be reviewed before choosing to cancel"
   print -r -- "  or force deletion with a typed-name confirmation. The Git branch is"
   print -r -- "  preserved. --yes skips only the normal clean-worktree confirmation."
+  print
+  print -r -- "PROJECT DEFAULTS"
+  print -r -- "  swm forget [repository]"
+  print -r -- ""
+  print -r -- "  The first time you fork a worktree whose source has a .env, swm"
+  print -r -- "  asks whether to copy it, then offers to remember the answer for"
+  print -r -- "  that project. Later forks apply the remembered answer without"
+  print -r -- "  asking. swm forget clears it so the prompt returns."
+  print -r -- ""
+  print -r -- "  Defaults are keyed by the project's main worktree and stored in"
+  print -r -- "  \$XDG_CONFIG_HOME/swm/projects.conf (default ~/.config/swm)."
+  print -r -- "  They apply to fork mode only; direct creation still requires an"
+  print -r -- "  explicit --with-env."
   print
   print -r -- "UPDATE"
   print -r -- "  swm update [--force]"
@@ -285,6 +299,109 @@ check_for_update() {
   if (( now - checked_at >= interval )); then
     refresh_update_cache "$cache_file" "$now" "$cached_version"
   fi
+}
+
+project_defaults_file() {
+  print -r -- "${XDG_CONFIG_HOME:-$HOME/.config}/swm/projects.conf"
+}
+
+# Identify a project by its main worktree, so every linked worktree of the same
+# clone resolves to one key.
+main_worktree_path() {
+  local first="$(
+    git -C "$1" worktree list --porcelain | sed -n '1s/^worktree //p'
+  )"
+  [[ -n "$first" ]] || return 1
+  print -r -- "${first:A}"
+}
+
+# Entries are "<setting>=<value><TAB><project path>". Splitting on the first tab
+# keeps the path intact even in the unlikely case that it contains one.
+project_default() {
+  local project_path="$1" setting="$2"
+  local file="$(project_defaults_file)"
+  [[ -f "$file" ]] || return 1
+
+  local line entry stored_path
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != '#'* && "$line" == *$'\t'* ]] || continue
+    entry="${line%%$'\t'*}"
+    stored_path="${line#*$'\t'}"
+    [[ "$stored_path" == "$project_path" && "${entry%%=*}" == "$setting" ]] \
+      || continue
+    print -r -- "${entry#*=}"
+    return 0
+  done < "$file"
+
+  return 1
+}
+
+set_project_default() {
+  local project_path="$1" setting="$2" value="$3"
+  local file="$(project_defaults_file)"
+  local directory="${file:h}"
+
+  mkdir -p -- "$directory" || return 1
+  local staged=""
+  staged="$(mktemp "${directory}/.projects.XXXXXX")" || return 1
+
+  {
+    print -r -- "# swm project defaults"
+    if [[ -f "$file" ]]; then
+      local line entry stored_path
+      while IFS= read -r line; do
+        [[ -n "$line" && "$line" != '#'* ]] || continue
+        if [[ "$line" == *$'\t'* ]]; then
+          entry="${line%%$'\t'*}"
+          stored_path="${line#*$'\t'}"
+          # Drop any previous value for this project and setting.
+          if [[ "$stored_path" == "$project_path" \
+            && "${entry%%=*}" == "$setting" ]]; then
+            continue
+          fi
+        fi
+        print -r -- "$line"
+      done < "$file"
+    fi
+    # An empty value removes the entry, so this block must still exit zero.
+    if [[ -n "$value" ]]; then
+      print -r -- "${setting}=${value}"$'\t'"${project_path}"
+    fi
+  } >> "$staged" || { rm -f -- "$staged"; return 1; }
+
+  mv -f -- "$staged" "$file" || { rm -f -- "$staged"; return 1; }
+}
+
+forget_project_defaults() {
+  local repo_input="${1:-.}"
+  local repo=""
+
+  if ! repo="$(git -C "$repo_input" rev-parse --show-toplevel 2>/dev/null)"; then
+    print -u2 "swm forget must run inside a Git repository, or receive one:"
+    print -u2 "  swm forget /path/to/repository"
+    return 1
+  fi
+
+  local project_path=""
+  if ! project_path="$(main_worktree_path "$repo")"; then
+    print -u2 "Could not determine the main worktree for: $repo"
+    return 1
+  fi
+
+  local current=""
+  if ! current="$(project_default "$project_path" "fork-env")"; then
+    print "No remembered defaults for ${project_path:t}."
+    print "  $project_path"
+    return 0
+  fi
+
+  if ! set_project_default "$project_path" "fork-env" ""; then
+    print -u2 "Could not update $(project_defaults_file)"
+    return 1
+  fi
+
+  print "Forgot the .env fork default (was: $current) for ${project_path:t}."
+  print "  $project_path"
 }
 
 has_herd() {
@@ -688,10 +805,34 @@ manage_worktrees() {
       create_command=("$new_name" "$selected_head" "$selected_path")
 
       if [[ -f "$selected_path/.env" ]]; then
-        local copy_env=""
-        read "copy_env?Copy .env and update it for the new worktree? [y/N]: "
-        if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
-          create_command+=("--with-env")
+        local remembered=""
+
+        if remembered="$(project_default "$main_path" "fork-env")"; then
+          if [[ "$remembered" == "yes" ]]; then
+            create_command+=("--with-env")
+            print "Copying .env (remembered for ${main_path:t})."
+          else
+            print "Not copying .env (remembered for ${main_path:t})."
+          fi
+          print "Undo with: swm forget"
+        else
+          local copy_env=""
+          local wants_env="no"
+          read "copy_env?Copy .env and update it for the new worktree? [y/N]: "
+          if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
+            create_command+=("--with-env")
+            wants_env="yes"
+          fi
+
+          local remember=""
+          read "remember?Remember this for ${main_path:t} from now on? [y/N]: "
+          if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
+            if set_project_default "$main_path" "fork-env" "$wants_env"; then
+              print "Saved. Undo with: swm forget"
+            else
+              print -u2 "Warning: could not save to $(project_defaults_file)"
+            fi
+          fi
         fi
       fi
 
@@ -755,6 +896,15 @@ if [[ "${1:-}" == "manage" ]]; then
     exit 2
   fi
   manage_worktrees "${2:-.}"
+  exit $?
+fi
+
+if [[ "${1:-}" == "forget" ]]; then
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm forget [repository]"
+    exit 2
+  fi
+  forget_project_defaults "${2:-.}"
   exit $?
 fi
 

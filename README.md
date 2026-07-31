@@ -94,6 +94,31 @@ swm
 `swm manage` is the explicit equivalent. With no repository argument, manage
 mode automatically uses the Git repository containing your current directory.
 
+## Remembering the .env choice
+
+When you fork a worktree whose source has a `.env`, `swm` asks whether to copy
+it, then offers to remember your answer for that project:
+
+```
+Copy .env and update it for the new worktree? [y/N]: y
+Remember this for myapp from now on? [y/N]: y
+```
+
+Later forks of that project apply the remembered answer without asking. Clear
+it to bring the prompt back:
+
+```sh
+swm forget
+```
+
+Defaults are keyed by the project's main worktree, so every linked worktree of
+the same clone shares one setting, and `swm forget` works from inside any of
+them. They are stored in `~/.config/swm/projects.conf`.
+
+This applies to fork mode only. Direct creation still requires an explicit
+`--with-env`, so a scripted `swm` run never copies a `.env` because of saved
+state you cannot see at the call site.
+
 Remove a managed worktree while preserving its Git branch:
 
 ```sh
@@ -108,6 +133,7 @@ otherwise. Override the root with `SWM_ROOT=/another/path`.
 | Variable | Purpose |
 | --- | --- |
 | `SWM_ROOT` | Worktree root directory. |
+| `XDG_CONFIG_HOME` | Location of `swm/projects.conf` (default `~/.config`). |
 | `SWM_NO_UPDATE_CHECK` | Set to `1` to disable the periodic update check. |
 | `SWM_UPDATE_CHECK_INTERVAL` | Seconds between update checks (default `172800`). |
 
