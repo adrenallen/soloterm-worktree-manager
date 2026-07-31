@@ -2,7 +2,7 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.5.0"
+SWM_VERSION="1.6.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -70,6 +70,7 @@ detail() {
 usage() {
   print -u2 "Usage: swm"
   print -u2 "       swm [--with-env|--no-env] <worktree-name> <branch-from> [repository]"
+  print -u2 "       swm new [repository]"
   print -u2 "       swm manage [repository]"
   print -u2 "       swm remove <worktree-name> [--yes]"
   print -u2 "       swm forget [repository]"
@@ -89,6 +90,10 @@ help_page() {
   print
   section "CREATE"
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env|--no-env]"
+  print -r -- "  swm new [repository]"
+  print
+  print -r -- "  swm new asks for everything it needs. It is the same as leaving"
+  print -r -- "  the name and branch off, and is what manage mode's 'n' runs."
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
   print -r -- "  becomes the folder name, and the Herd site name when Herd is present."
@@ -108,6 +113,9 @@ help_page() {
   print -r -- "  exact HEAD into a new managed worktree, optionally copying its"
   print -r -- "  .env, or remove a worktree managed under SWM_ROOT."
   print -r -- "  Only worktrees under SWM_ROOT can be deleted outright."
+  print
+  print -r -- "  Answer 'n' at the worktree prompt to create a brand new worktree"
+  print -r -- "  by answering questions, so plain 'swm' covers every operation."
   print
   print -r -- "  A worktree listed as SOLO 'no' can be added to Solo as a project."
   print -r -- "  Adding registers the existing directory only: no branch is created"
@@ -229,13 +237,13 @@ update_swm() {
   local force="${1:-}"
 
   if [[ -n "$force" && "$force" != "--force" ]]; then
-    print -u2 "Unknown option: $force"
+    fail "Unknown option: $force"
     print -u2 "Usage: swm update [--force]"
     return 2
   fi
 
   if ! command -v curl >/dev/null; then
-    print -u2 "curl is required to update swm."
+    fail "curl is required to update swm."
     return 1
   fi
 
@@ -250,7 +258,7 @@ update_swm() {
   case "$target" in
     /opt/homebrew/*|/usr/local/Cellar/*|/nix/store/*|/opt/local/*)
       print -u2 "swm appears to be installed by a package manager:"
-      print -u2 "  $target"
+      detail "$target"
       print -u2 "Update it with that package manager instead."
       return 1
       ;;
@@ -261,14 +269,14 @@ update_swm() {
   if [[ "$force" != "--force" ]] \
     && git -C "$target_directory" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     print -u2 "swm is running from a Git checkout:"
-    print -u2 "  $target"
+    detail "$target"
     print -u2 "Use git to update it, or re-run with --force to overwrite."
     return 1
   fi
 
   if [[ ! -w "$target" || ! -w "$target_directory" ]]; then
     print -u2 "No write permission for the installed script:"
-    print -u2 "  $target"
+    detail "$target"
     return 1
   fi
 
@@ -301,7 +309,7 @@ update_swm() {
 
   if ! chmod "$(stat -f '%Lp' "$target")" "$staged"; then
     rm -f -- "$staged"
-    print -u2 "Could not set permissions on the downloaded script."
+    fail "Could not set permissions on the downloaded script."
     return 1
   fi
 
@@ -309,7 +317,7 @@ update_swm() {
   # intact, so the in-flight process keeps reading the old file safely.
   if ! mv -f -- "$staged" "$target"; then
     rm -f -- "$staged"
-    print -u2 "Could not replace $target"
+    fail "Could not replace $target"
     return 1
   fi
 
@@ -464,7 +472,7 @@ forget_project_defaults() {
 
   local project_path=""
   if ! project_path="$(main_worktree_path "$repo")"; then
-    print -u2 "Could not determine the main worktree for: $repo"
+    fail "Could not determine the main worktree for: $repo"
     return 1
   fi
 
@@ -476,7 +484,7 @@ forget_project_defaults() {
   fi
 
   if ! set_project_default "$project_path" "fork-env" ""; then
-    print -u2 "Could not update $(project_defaults_file)"
+    fail "Could not update $(project_defaults_file)"
     return 1
   fi
 
@@ -509,7 +517,7 @@ solo_project_id_for() {
   fi
 
   if (( ${#ids} > 1 )); then
-    print -u2 "Multiple Solo projects unexpectedly match: $worktree_path"
+    fail "Multiple Solo projects unexpectedly match: $worktree_path"
     return 2
   fi
 
@@ -601,14 +609,14 @@ remove_worktree() {
   fi
 
   if [[ -n "$confirmation_flag" && "$confirmation_flag" != "--yes" ]]; then
-    print -u2 "Unknown option: $confirmation_flag"
+    fail "Unknown option: $confirmation_flag"
     print -u2 "Usage: swm remove <worktree-name> [--yes]"
     return 2
   fi
 
   local site_name="$(site_slug "$requested_name")"
   if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
-    print -u2 "Invalid worktree name: $requested_name"
+    fail "Invalid worktree name: $requested_name"
     return 1
   fi
 
@@ -618,7 +626,7 @@ remove_worktree() {
   solo status >/dev/null
 
   if ! command -v jq >/dev/null; then
-    print -u2 "jq is required to find the matching Solo project."
+    fail "jq is required to find the matching Solo project."
     return 1
   fi
 
@@ -640,7 +648,7 @@ remove_worktree() {
   if [[ -e "$worktree_path" ]]; then
     if [[ ! -d "$worktree_path" || ! -f "$worktree_path/.git" ]]; then
       print -u2 "Refusing to remove a path that is not a linked Git worktree:"
-      print -u2 "  $worktree_path"
+      detail "$worktree_path"
       return 1
     fi
 
@@ -651,7 +659,7 @@ remove_worktree() {
 
     if [[ "$actual_top" != "$worktree_path" ]]; then
       print -u2 "Refusing to remove an unexpected Git directory:"
-      print -u2 "  $worktree_path"
+      detail "$worktree_path"
       return 1
     fi
 
@@ -718,7 +726,7 @@ remove_worktree() {
       pwd -P
     )"
   elif [[ -z "$project_id" ]]; then
-    print -u2 "No managed worktree or Solo project found for: $requested_name"
+    fail "No managed worktree or Solo project found for: $requested_name"
     return 1
   fi
 
@@ -783,7 +791,7 @@ manage_worktrees() {
   fi
 
   if ! command -v jq >/dev/null; then
-    print -u2 "jq is required for manage mode."
+    fail "jq is required for manage mode."
     return 1
   fi
 
@@ -833,7 +841,7 @@ manage_worktrees() {
   done < <(git -C "$repo" worktree list --porcelain -z)
 
   if (( ${#worktree_paths} == 0 )); then
-    print -u2 "No worktrees found."
+    fail "No worktrees found."
     return 1
   fi
 
@@ -912,20 +920,28 @@ manage_worktrees() {
   fi
 
   local selection=""
-  read "selection?  ${B}Select${R} ${D}[1-${#worktree_paths}, q]${R} " || selection=""
+  read "selection?  ${B}Select${R} ${D}[1-${#worktree_paths}, n=new, q]${R} " \
+    || selection=""
   if [[ "${selection:l}" == "q" || -z "$selection" ]]; then
     hint "  Cancelled."
     return 0
   fi
 
+  if [[ "${selection:l}" == "n" || "${selection:l}" == "new" ]]; then
+    print
+    # This run already reported any available update.
+    SWM_NO_UPDATE_CHECK=1 "$SWM_SCRIPT" new "$repo"
+    return $?
+  fi
+
   if [[ "$selection" != <-> ]]; then
-    print -u2 "Invalid selection: $selection"
+    fail "Invalid selection: $selection"
     return 2
   fi
 
   local selected_index=$(( 10#$selection ))
   if (( selected_index < 1 || selected_index > ${#worktree_paths} )); then
-    print -u2 "Selection is out of range: $selection"
+    fail "Selection is out of range: $selection"
     return 2
   fi
 
@@ -966,7 +982,7 @@ manage_worktrees() {
       local new_name=""
       read "new_name?  ${B}New worktree / branch name${R} " || new_name=""
       if [[ -z "$new_name" ]]; then
-        print -u2 "A new worktree name is required."
+        fail "A new worktree name is required."
         return 2
       fi
 
@@ -1170,6 +1186,17 @@ if [[ "${1:-}" == "remove" || "${1:-}" == "rm" ]]; then
   exit $?
 fi
 
+# "swm new [repository]" is creation with nothing supplied up front. Blanking
+# the name and branch lets the normal create path below prompt for them, so the
+# interactive flow has no separate implementation to keep in step.
+if [[ "${1:-}" == "new" ]]; then
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm new [repository]"
+    exit 2
+  fi
+  set -- "" "" "${2:-.}"
+fi
+
 with_env=false
 without_env=false
 typeset -a create_args
@@ -1184,7 +1211,7 @@ for arg in "$@"; do
       without_env=true
       ;;
     -*)
-      print -u2 "Unknown option: $arg"
+      fail "Unknown option: $arg"
       usage
       exit 2
       ;;
@@ -1228,67 +1255,8 @@ if [[ -z "$branch_from" ]]; then
 fi
 
 if [[ -z "$worktree_name" || -z "$branch_from" ]]; then
-  print -u2 "Both the worktree name and branch-from value are required."
+  fail "Both the worktree name and branch-from value are required."
   exit 2
-fi
-
-# With neither flag given, apply the project's remembered choice, or ask. The
-# prompt is skipped without a terminal so cron jobs and scripts keep behaving
-# predictably; pass --with-env or --no-env to be explicit there.
-if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; then
-  project_key=""
-  if project_key="$(main_worktree_path "$repo")"; then
-    remembered_env=""
-    if remembered_env="$(project_default "$project_key" "fork-env")"; then
-      if [[ "$remembered_env" == "yes" ]]; then
-        with_env=true
-        hint "  Copying .env (remembered for ${project_key:t}) — undo: swm forget"
-      else
-        hint "  Not copying .env (remembered for ${project_key:t}) — undo: swm forget"
-      fi
-    elif [[ -t 0 ]]; then
-      copy_env=""
-      wants_env="no"
-      # A closed stdin answers No rather than aborting the run.
-      read "copy_env?  ${B}Copy .env into the new worktree?${R} ${D}[y/N]${R} " \
-        || copy_env=""
-      if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
-        with_env=true
-        wants_env="yes"
-      fi
-
-      remember=""
-      read "remember?  ${B}Remember this for ${project_key:t}?${R} ${D}[y/N]${R} " \
-        || remember=""
-      if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
-        if set_project_default "$project_key" "fork-env" "$wants_env"; then
-          hint "  Saved — undo: swm forget"
-        else
-          print -u2 "Warning: could not save to $(project_defaults_file)"
-        fi
-      fi
-    fi
-  fi
-fi
-
-if [[ "$with_env" == true ]]; then
-  if [[ ! -f "$source_env" || ! -r "$source_env" ]]; then
-    print -u2 "Cannot copy .env because the source is missing or unreadable:"
-    print -u2 "  $source_env"
-    exit 1
-  fi
-
-  if git -C "$repo" ls-files --error-unmatch .env >/dev/null 2>&1; then
-    print -u2 "Refusing to copy .env because it is tracked by Git."
-    print -u2 "This is intended for ignored, machine-local Laravel .env files."
-    exit 1
-  fi
-
-  if ! git -C "$repo" check-ignore -q -- .env; then
-    print -u2 "Refusing to copy .env because it is not ignored by Git."
-    print -u2 "Add .env to the repository's .gitignore first."
-    exit 1
-  fi
 fi
 
 # The requested worktree name is also the new Git branch name.
@@ -1296,14 +1264,14 @@ new_branch="$worktree_name"
 git -C "$repo" check-ref-format --branch "$new_branch" >/dev/null
 
 if git -C "$repo" show-ref --verify --quiet "refs/heads/$new_branch"; then
-  print -u2 "Local branch already exists: $new_branch"
-  print -u2 "Choose a new worktree name/branch."
+  fail "Local branch already exists: $new_branch"
+  detail "Choose a new worktree name/branch."
   exit 1
 fi
 
 if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$new_branch"; then
-  print -u2 "Remote branch already exists: origin/$new_branch"
-  print -u2 "Choose a new worktree name/branch."
+  fail "Remote branch already exists: origin/$new_branch"
+  detail "Choose a new worktree name/branch."
   exit 1
 fi
 
@@ -1319,7 +1287,7 @@ worktree_root="$(default_worktree_root)"
 worktree_path="${worktree_root}/${site_name}"
 
 if [[ -e "$worktree_path" ]]; then
-  print -u2 "Destination already exists: $worktree_path"
+  fail "Destination already exists: $worktree_path"
   exit 1
 fi
 
@@ -1345,8 +1313,8 @@ elif git -C "$repo" rev-parse --verify --quiet "${branch_from}^{commit}" >/dev/n
 elif git -C "$repo" rev-parse --verify --quiet "origin/${branch_from}^{commit}" >/dev/null; then
   start_point="origin/$branch_from"
 else
-  print -u2 "Cannot find branch-from ref: $branch_from"
-  print -u2 "Try git fetch first, or pass an explicit ref such as origin/main."
+  fail "Cannot find branch-from ref: $branch_from"
+  detail "Try git fetch first, or pass an explicit ref such as origin/main."
   exit 1
 fi
 
@@ -1376,6 +1344,64 @@ if has_herd; then
   fi
 fi
 
+# Asked only once the name, branch, and destination are all known to be good,
+# so a rejected branch name never costs the user a round of questions first.
+if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; then
+  project_key=""
+  if project_key="$(main_worktree_path "$repo")"; then
+    remembered_env=""
+    if remembered_env="$(project_default "$project_key" "fork-env")"; then
+      if [[ "$remembered_env" == "yes" ]]; then
+        with_env=true
+        hint "  Copying .env (remembered for ${project_key:t}) — undo: swm forget"
+      else
+        hint "  Not copying .env (remembered for ${project_key:t}) — undo: swm forget"
+      fi
+    elif [[ -t 0 ]]; then
+      copy_env=""
+      wants_env="no"
+      # A closed stdin answers No rather than aborting the run.
+      read "copy_env?  ${B}Copy .env into the new worktree?${R} ${D}[y/N]${R} " \
+        || copy_env=""
+      if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
+        with_env=true
+        wants_env="yes"
+      fi
+
+      remember=""
+      read "remember?  ${B}Remember this for ${project_key:t}?${R} ${D}[y/N]${R} " \
+        || remember=""
+      if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
+        if set_project_default "$project_key" "fork-env" "$wants_env"; then
+          hint "  Saved — undo: swm forget"
+        else
+          fail "Could not save to $(project_defaults_file)"
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ "$with_env" == true ]]; then
+  if [[ ! -f "$source_env" || ! -r "$source_env" ]]; then
+    fail "Cannot copy .env because the source is missing or unreadable:"
+    detail "$source_env"
+    exit 1
+  fi
+
+  if git -C "$repo" ls-files --error-unmatch .env >/dev/null 2>&1; then
+    fail "Refusing to copy .env because it is tracked by Git."
+    detail "This is intended for ignored, machine-local Laravel .env files."
+    exit 1
+  fi
+
+  if ! git -C "$repo" check-ignore -q -- .env; then
+    fail "Refusing to copy .env because it is not ignored by Git."
+    detail "Add .env to the repository's .gitignore first."
+    exit 1
+  fi
+fi
+
 hint "Creating branch '$new_branch' from '$start_point'…"
 git -C "$repo" worktree add -q -b "$new_branch" "$worktree_path" "$start_point"
 
@@ -1391,7 +1417,7 @@ if [[ "$with_env" == true ]]; then
 
   if [[ -e "$destination_env" ]]; then
     print -u2 "Worktree created, but its .env already exists; it was not overwritten:"
-    print -u2 "  $destination_env"
+    detail "$destination_env"
     exit 1
   fi
 

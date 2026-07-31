@@ -85,11 +85,20 @@ Copy the source `.env` and update `APP_NAME` (plus `APP_URL` under Herd):
 swm checkout-redesign dev --with-env
 ```
 
-Interactively fork or remove an existing worktree:
+Create one by answering questions instead of passing arguments:
+
+```sh
+swm new
+```
+
+Interactively create, fork, add, or remove worktrees:
 
 ```sh
 swm
 ```
+
+Answer `n` at the worktree prompt to create a new one, so plain `swm` covers
+every operation without remembering any flags.
 
 `swm manage` is the explicit equivalent. With no repository argument, manage
 mode automatically uses the Git repository containing your current directory.
@@ -108,6 +117,8 @@ a Solo project:
    3  hotfix                        external   ✗     ~/scratch/hotfix
 
   ✗ 1 not in Solo — select one to add it
+
+  Select [1-3, n=new, q]
 ```
 
 Types are colour-coded (`main` magenta, `managed` green, `external` yellow) and
