@@ -2,11 +2,21 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
+SWM_VERSION="1.1.0"
+SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
+SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
+
+# Resolved here because zsh rebinds $0 to the function name inside a function.
+# :A also follows a symlinked install back to the real file.
+SWM_SCRIPT="${0:A}"
+
 usage() {
   print -u2 "Usage: swm"
   print -u2 "       swm [--with-env] <worktree-name> <branch-from> [repository]"
   print -u2 "       swm manage [repository]"
   print -u2 "       swm remove <worktree-name> [--yes]"
+  print -u2 "       swm update [--force]"
+  print -u2 "       swm version"
   print -u2 "       swm help"
   print -u2 "Example: swm billing-redesign dev"
   print -u2 "Example: swm billing-redesign dev --with-env"
@@ -22,7 +32,7 @@ help_page() {
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env]"
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
-  print -r -- "  becomes the folder and Herd site name."
+  print -r -- "  becomes the folder name, and the Herd site name when Herd is present."
   print
   print -r -- "  <branch-from> may be a branch, tag, commit, or explicit ref. Simple"
   print -r -- "  branch names such as main or dev refresh and prefer origin/<name>."
@@ -35,15 +45,17 @@ help_page() {
   print -r -- "  swm manage [repository]"
   print
   print -r -- "  Show an interactive list of the repository's current worktrees. Pick"
-  print -r -- "  one to fork its exact HEAD into a new Herd/Solo worktree, optionally"
+  print -r -- "  one to fork its exact HEAD into a new managed worktree, optionally"
   print -r -- "  copying its .env, or remove a worktree managed under SWM_ROOT."
   print -r -- "  Main and externally managed worktrees can be forked but not removed."
   print
   print -r -- "OPTIONS"
   print -r -- "  --with-env"
   print -r -- "      Copy the source repository's ignored .env into the new worktree."
-  print -r -- "      APP_NAME is set to the Herd site name and APP_URL is set to the"
-  print -r -- "      generated local URL. Tracked or non-ignored .env files are refused."
+  print -r -- "      APP_NAME is set to the worktree site name. With Herd installed,"
+  print -r -- "      APP_URL is also set to the generated local URL; without Herd the"
+  print -r -- "      copied APP_URL is left unchanged. Tracked or non-ignored .env"
+  print -r -- "      files are refused."
   print
   print -r -- "REMOVE"
   print -r -- "  swm remove <worktree-name>"
@@ -54,24 +66,242 @@ help_page() {
   print -r -- "  or force deletion with a typed-name confirmation. The Git branch is"
   print -r -- "  preserved. --yes skips only the normal clean-worktree confirmation."
   print
+  print -r -- "UPDATE"
+  print -r -- "  swm update [--force]"
+  print -r -- "  swm version"
+  print -r -- ""
+  print -r -- "  Download the latest swm and replace the installed script in"
+  print -r -- "  place. The download is rejected unless it parses as a valid swm."
+  print -r -- "  Package-manager installs are refused, and a Git checkout is"
+  print -r -- "  refused unless --force is given. --force also reinstalls the"
+  print -r -- "  current version."
+  print -r -- ""
+  print -r -- "  Separately, swm checks for a newer version every two days and"
+  print -r -- "  prints a one-line notice. The check runs in the background and"
+  print -r -- "  reports from a cache, so it never delays a command."
+  print
   print -r -- "PATHS"
-  print -r -- "  Worktrees default to: \$HOME/Herd/<site-name>"
-  print -r -- "  Override the parked root with: SWM_ROOT=/another/path"
+  print -r -- "  With Herd:    \$HOME/Herd/<site-name>"
+  print -r -- "  Without Herd: \$HOME/worktrees/<site-name>"
+  print -r -- "  Override the root with: SWM_ROOT=/another/path"
+  print
+  print -r -- "ENVIRONMENT"
+  print -r -- "  SWM_ROOT                     Worktree root directory."
+  print -r -- "  SWM_NO_UPDATE_CHECK=1        Disable the periodic update check."
+  print -r -- "  SWM_UPDATE_CHECK_INTERVAL    Seconds between checks (default 172800)."
   print
   print -r -- "EXAMPLES"
   print -r -- "  swm checkout-redesign dev --with-env"
   print -r -- "  swm api-fix main /path/to/project"
   print -r -- "  swm manage"
   print -r -- "  swm remove checkout-redesign"
+  print -r -- "  swm update"
   print
   print -r -- "REQUIREMENTS"
-  print -r -- "  macOS, Zsh, Git, jq, Laravel Herd, Solo, and Solo's local HTTP API."
+  print -r -- "  macOS, Zsh, Git, jq, Solo, and Solo's local HTTP API."
+  print -r -- "  Laravel Herd is optional. When installed, worktrees are parked and"
+  print -r -- "  served at http://<site-name>.<tld>."
 }
 
 site_slug() {
   print -r -- "$1" \
     | tr '[:upper:]_/' '[:lower:]--' \
     | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//'
+}
+
+update_cache_file() {
+  print -r -- "${XDG_CACHE_HOME:-$HOME/.cache}/swm/update-check"
+}
+
+# Read the version out of a swm script without executing any of it.
+script_version() {
+  sed -n -E 's/^SWM_VERSION="([^"]+)"$/\1/p' "$1" | head -1
+}
+
+download_swm() {
+  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --max-time 20 -o "$1" -- "$SWM_SOURCE_URL"
+}
+
+# Guard against a truncated download, an HTML error page, or anything else that
+# is not a runnable swm. This is an integrity check, not an authenticity one.
+valid_swm_script() {
+  local candidate="$1"
+  [[ -s "$candidate" ]] || return 1
+  [[ "$(head -1 -- "$candidate")" == "#!/bin/zsh" ]] || return 1
+  [[ -n "$(script_version "$candidate")" ]] || return 1
+  zsh -n "$candidate" 2>/dev/null || return 1
+}
+
+update_swm() {
+  local force="${1:-}"
+
+  if [[ -n "$force" && "$force" != "--force" ]]; then
+    print -u2 "Unknown option: $force"
+    print -u2 "Usage: swm update [--force]"
+    return 2
+  fi
+
+  if ! command -v curl >/dev/null; then
+    print -u2 "curl is required to update swm."
+    return 1
+  fi
+
+  local target="$SWM_SCRIPT"
+  if [[ ! -f "$target" ]]; then
+    print -u2 "Cannot locate the running swm script to update."
+    return 1
+  fi
+
+  local target_directory="${target:h}"
+
+  case "$target" in
+    /opt/homebrew/*|/usr/local/Cellar/*|/nix/store/*|/opt/local/*)
+      print -u2 "swm appears to be installed by a package manager:"
+      print -u2 "  $target"
+      print -u2 "Update it with that package manager instead."
+      return 1
+      ;;
+  esac
+
+  # A checkout is someone's working copy of swm itself; overwriting it would
+  # silently discard their edits.
+  if [[ "$force" != "--force" ]] \
+    && git -C "$target_directory" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    print -u2 "swm is running from a Git checkout:"
+    print -u2 "  $target"
+    print -u2 "Use git to update it, or re-run with --force to overwrite."
+    return 1
+  fi
+
+  if [[ ! -w "$target" || ! -w "$target_directory" ]]; then
+    print -u2 "No write permission for the installed script:"
+    print -u2 "  $target"
+    return 1
+  fi
+
+  print "Checking $SWM_REPOSITORY for updates…"
+
+  # Stage the download beside the target so the replacement below is a
+  # same-filesystem rename rather than a cross-device copy.
+  local staged="$(mktemp "${target_directory}/.swm-update.XXXXXX")"
+
+  if ! download_swm "$staged"; then
+    rm -f -- "$staged"
+    print -u2 "Could not download the latest swm from $SWM_SOURCE_URL"
+    return 1
+  fi
+
+  if ! valid_swm_script "$staged"; then
+    rm -f -- "$staged"
+    print -u2 "The downloaded file is not a valid swm script; nothing was changed."
+    return 1
+  fi
+
+  local latest="$(script_version "$staged")"
+
+  autoload -Uz is-at-least
+  if [[ "$force" != "--force" ]] && is-at-least "$latest" "$SWM_VERSION"; then
+    rm -f -- "$staged"
+    print "Already up to date (swm $SWM_VERSION)."
+    return 0
+  fi
+
+  if ! chmod "$(stat -f '%Lp' "$target")" "$staged"; then
+    rm -f -- "$staged"
+    print -u2 "Could not set permissions on the downloaded script."
+    return 1
+  fi
+
+  # Renaming swaps the directory entry and leaves this running script's inode
+  # intact, so the in-flight process keeps reading the old file safely.
+  if ! mv -f -- "$staged" "$target"; then
+    rm -f -- "$staged"
+    print -u2 "Could not replace $target"
+    return 1
+  fi
+
+  # Keep the notice from advertising a version that is now installed.
+  rm -f -- "$(update_cache_file)"
+
+  print "Updated swm $SWM_VERSION → $latest"
+  print "  $target"
+}
+
+# Refresh the cached latest-version marker without blocking this run. The
+# timestamp is recorded even when the download fails so an offline machine
+# backs off for the full interval instead of retrying on every invocation.
+refresh_update_cache() {
+  local cache_file="$1" now="$2" previous_version="$3"
+  local cache_directory="${cache_file:h}"
+
+  {
+    mkdir -p -- "$cache_directory" || exit 0
+
+    local staged="" latest="$previous_version" staged_cache=""
+    staged="$(mktemp "${TMPDIR:-/tmp}/swm-check.XXXXXX")" || exit 0
+
+    if download_swm "$staged" && valid_swm_script "$staged"; then
+      latest="$(script_version "$staged")"
+      [[ -n "$latest" ]] || latest="$previous_version"
+    fi
+    rm -f -- "$staged"
+
+    staged_cache="$(mktemp "${cache_directory}/staged.XXXXXX")" || exit 0
+    print -r -- "$now" > "$staged_cache"
+    print -r -- "$latest" >> "$staged_cache"
+    mv -f -- "$staged_cache" "$cache_file"
+  } >/dev/null 2>&1 &!
+}
+
+# Report from the cached result so no run ever waits on the network, then kick
+# off a background refresh when the interval has elapsed.
+check_for_update() {
+  [[ -z "${SWM_NO_UPDATE_CHECK:-}" ]] || return 0
+  command -v curl >/dev/null || return 0
+
+  local cache_file="$(update_cache_file)"
+  local interval="${SWM_UPDATE_CHECK_INTERVAL:-172800}"
+  local now="$(date +%s)"
+  local checked_at=0
+  local cached_version=""
+
+  if [[ -f "$cache_file" ]]; then
+    local -a cache_lines
+    cache_lines=("${(@f)$(<"$cache_file")}")
+    checked_at="${cache_lines[1]:-0}"
+    cached_version="${cache_lines[2]:-}"
+    [[ "$checked_at" == <-> ]] || checked_at=0
+  fi
+
+  if [[ -n "$cached_version" ]]; then
+    autoload -Uz is-at-least
+    if ! is-at-least "$cached_version" "$SWM_VERSION"; then
+      print -u2 "swm $cached_version is available (installed: $SWM_VERSION). Run: swm update"
+      print -u2
+    fi
+  fi
+
+  if (( now - checked_at >= interval )); then
+    refresh_update_cache "$cache_file" "$now" "$cached_version"
+  fi
+}
+
+has_herd() {
+  command -v herd >/dev/null
+}
+
+# Herd users keep the parked $HOME/Herd default. Without Herd, fall back to a
+# neutral directory, but keep using an existing $HOME/Herd so worktrees created
+# while Herd was installed stay visible after it is removed.
+default_worktree_root() {
+  if [[ -n "${SWM_ROOT:-}" ]]; then
+    print -r -- "$SWM_ROOT"
+  elif has_herd || [[ -d "$HOME/Herd" ]]; then
+    print -r -- "$HOME/Herd"
+  else
+    print -r -- "$HOME/worktrees"
+  fi
 }
 
 repository_name() {
@@ -131,7 +361,7 @@ set_env_value() {
 remove_worktree() {
   local requested_name="${1:-}"
   local confirmation_flag="${2:-}"
-  local worktree_root="${SWM_ROOT:-$HOME/Herd}"
+  local worktree_root="$(default_worktree_root)"
 
   if [[ -z "$requested_name" ]]; then
     print -u2 "Usage: swm remove <worktree-name> [--yes]"
@@ -263,7 +493,7 @@ remove_worktree() {
       pwd -P
     )"
   elif [[ -z "$project_id" ]]; then
-    print -u2 "No Herd worktree or Solo project found for: $requested_name"
+    print -u2 "No managed worktree or Solo project found for: $requested_name"
     return 1
   fi
 
@@ -324,7 +554,7 @@ manage_worktrees() {
   solo status >/dev/null
 
   local projects_json="$(solo projects list --json)"
-  local worktree_root="${SWM_ROOT:-$HOME/Herd}"
+  local worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
   local -a worktree_paths worktree_heads worktree_branches worktree_kinds
   worktree_paths=()
@@ -386,7 +616,7 @@ manage_worktrees() {
     if [[ "$actual_path" == "$main_path" ]]; then
       kind="main"
     elif [[ "$actual_path" == "$canonical_root"/* ]]; then
-      kind="Herd"
+      kind="managed"
     else
       kind="external"
     fi
@@ -459,18 +689,19 @@ manage_worktrees() {
 
       if [[ -f "$selected_path/.env" ]]; then
         local copy_env=""
-        read "copy_env?Copy .env and update it for the new Herd URL? [y/N]: "
+        read "copy_env?Copy .env and update it for the new worktree? [y/N]: "
         if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
           create_command+=("--with-env")
         fi
       fi
 
       print
-      local swm_executable="${commands[swm]:-$0}"
-      "$swm_executable" "${create_command[@]}"
+      local swm_executable="${commands[swm]:-$SWM_SCRIPT}"
+      # This run already reported any available update.
+      SWM_NO_UPDATE_CHECK=1 "$swm_executable" "${create_command[@]}"
       ;;
     r|remove)
-      if [[ "$selected_kind" != "Herd" ]]; then
+      if [[ "$selected_kind" != "managed" ]]; then
         print -u2 "Only worktrees directly managed under $canonical_root can be removed."
         print -u2 "This '$selected_kind' worktree may still be used as a fork source."
         return 1
@@ -488,14 +719,30 @@ manage_worktrees() {
   esac
 }
 
-if (( $# == 0 )); then
-  manage_worktrees "."
-  exit $?
+if [[ "${1:-}" == "version" || "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
+  print -r -- "swm $SWM_VERSION"
+  exit 0
 fi
 
 if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   help_page
   exit 0
+fi
+
+if [[ "${1:-}" == "update" ]]; then
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm update [--force]"
+    exit 2
+  fi
+  update_swm "${2:-}"
+  exit $?
+fi
+
+check_for_update
+
+if (( $# == 0 )); then
+  manage_worktrees "."
+  exit $?
 fi
 
 if [[ "${1:-}" == "manage" ]]; then
@@ -616,7 +863,7 @@ if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
   exit 1
 fi
 
-worktree_root="${SWM_ROOT:-$HOME/Herd}"
+worktree_root="$(default_worktree_root)"
 worktree_path="${worktree_root}/${site_name}"
 
 if [[ -e "$worktree_path" ]]; then
@@ -655,27 +902,27 @@ fi
 # newly created worktree waiting to be imported.
 solo status >/dev/null
 
-if ! command -v herd >/dev/null; then
-  print -u2 "Laravel Herd's CLI is not available."
-  exit 1
-fi
-
-if ! command -v jq >/dev/null; then
-  print -u2 "jq is required to verify Laravel Herd's parked paths."
-  exit 1
-fi
-
-tld="$(herd tld)"
-site_url="http://${site_name}.${tld}"
-
 mkdir -p -- "$worktree_root"
-
-# Keep custom SWM_ROOT locations working by parking them once when necessary.
 canonical_root="${worktree_root:A}"
-if ! herd paths \
-  | jq -e --arg root "$canonical_root" \
-      'map(rtrimstr("/")) | index($root) != null' >/dev/null; then
-  herd park "$canonical_root"
+
+# Herd is optional. Without it, the worktree is still created and imported into
+# Solo; only the local site URL and parked-path handling are skipped.
+site_url=""
+if has_herd; then
+  if ! command -v jq >/dev/null; then
+    print -u2 "jq is required to verify Laravel Herd's parked paths."
+    exit 1
+  fi
+
+  tld="$(herd tld)"
+  site_url="http://${site_name}.${tld}"
+
+  # Keep custom SWM_ROOT locations working by parking them once when necessary.
+  if ! herd paths \
+    | jq -e --arg root "$canonical_root" \
+        'map(rtrimstr("/")) | index($root) != null' >/dev/null; then
+    herd park "$canonical_root"
+  fi
 fi
 
 print "Creating branch '$new_branch' from '$start_point'…"
@@ -699,7 +946,12 @@ if [[ "$with_env" == true ]]; then
 
   /bin/cp -p "$source_env" "$destination_env"
   set_env_value "$destination_env" "APP_NAME" "\"${site_name}\""
-  set_env_value "$destination_env" "APP_URL" "$site_url"
+
+  # Without Herd there is no generated local URL, so the copied APP_URL is left
+  # as-is rather than pointed at a host that does not resolve.
+  if [[ -n "$site_url" ]]; then
+    set_env_value "$destination_env" "APP_URL" "$site_url"
+  fi
 fi
 
 repo_name="$(repository_name "$repo")"
@@ -714,7 +966,11 @@ print "Created and added to Solo:"
 print "  Branch:  $new_branch"
 print "  From:    $start_point"
 print "  Path:    $worktree_path"
-print "  URL:     $site_url"
+[[ -n "$site_url" ]] && print "  URL:     $site_url"
 if [[ "$with_env" == true ]]; then
-  print "  Env:     copied; APP_NAME and APP_URL updated"
+  if [[ -n "$site_url" ]]; then
+    print "  Env:     copied; APP_NAME and APP_URL updated"
+  else
+    print "  Env:     copied; APP_NAME updated"
+  fi
 fi

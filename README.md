@@ -9,23 +9,28 @@ When you create a worktree, `swm`:
 
 1. Creates a new Git branch and linked worktree from `main`, `dev`, another
    branch, a tag, or a commit.
-2. Places it under `$HOME/Herd` so [Laravel Herd](https://herd.laravel.com)
-   automatically serves it at `http://<worktree-name>.test`.
+2. Places it in a managed worktree root — `$HOME/Herd` when
+   [Laravel Herd](https://herd.laravel.com) is installed, so Herd automatically
+   serves it at `http://<worktree-name>.test`.
 3. Optionally copies the source project's ignored `.env`, then updates
-   `APP_NAME` and `APP_URL` for the new Herd site.
+   `APP_NAME` (and `APP_URL`, when Herd provides a local site URL).
 4. Registers the worktree as a separate project in
    [Solo](https://soloterm.com), ready for its own commands, terminals, and
    agents.
 
 It also provides an interactive manager for forking existing worktrees and
-cleanly removing Herd/Solo worktrees when they are no longer needed.
+cleanly removing managed worktrees when they are no longer needed.
 
 ## Requirements
 
 - macOS and Zsh
 - Git and `jq`
-- Laravel Herd with a parked worktree directory
 - Solo with its local HTTP API and `solo` CLI enabled
+
+[Laravel Herd](https://herd.laravel.com) is optional. When it is installed,
+`swm` parks the worktree root, derives the local TLD, and points `APP_URL` at
+the generated site. Without Herd, worktree creation and Solo registration work
+exactly the same — only the local site URL is skipped.
 
 ## Install
 
@@ -43,6 +48,29 @@ Make sure `$HOME/.local/bin` is on your `PATH`, then run:
 swm help
 ```
 
+## Updating
+
+```sh
+swm update
+```
+
+This downloads the latest `swm` and replaces the installed script in place.
+The download is rejected unless it is a non-empty, syntactically valid `swm`
+script with a version, so a truncated or redirected response cannot overwrite a
+working install. The replacement is a same-directory rename, so updating while
+`swm` is running is safe.
+
+`swm update` refuses to overwrite a package-manager install, and refuses to
+overwrite a Git checkout unless you pass `--force`.
+
+`swm` also checks for a newer version every two days and prints a one-line
+notice. The check runs in the background and reports from a cache, so it never
+delays a command. Disable it with `SWM_NO_UPDATE_CHECK=1`.
+
+```sh
+swm version
+```
+
 ## Quick usage
 
 Create a worktree from the current repository:
@@ -51,7 +79,7 @@ Create a worktree from the current repository:
 swm checkout-redesign dev
 ```
 
-Copy the source `.env` and update `APP_NAME` and `APP_URL` for Herd:
+Copy the source `.env` and update `APP_NAME` (plus `APP_URL` under Herd):
 
 ```sh
 swm checkout-redesign dev --with-env
@@ -72,8 +100,16 @@ Remove a managed worktree while preserving its Git branch:
 swm remove checkout-redesign
 ```
 
-Worktrees default to `$HOME/Herd`. Override that parked directory with
-`SWM_ROOT=/another/path`.
+Worktrees default to `$HOME/Herd` when Herd is installed, and `$HOME/worktrees`
+otherwise. Override the root with `SWM_ROOT=/another/path`.
+
+## Environment
+
+| Variable | Purpose |
+| --- | --- |
+| `SWM_ROOT` | Worktree root directory. |
+| `SWM_NO_UPDATE_CHECK` | Set to `1` to disable the periodic update check. |
+| `SWM_UPDATE_CHECK_INTERVAL` | Seconds between update checks (default `172800`). |
 
 ## Safety
 
