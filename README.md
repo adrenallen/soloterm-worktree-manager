@@ -100,13 +100,19 @@ Manage mode lists every worktree in the repository and whether each is already
 a Solo project:
 
 ```
-  #  BRANCH                        TYPE      SOLO    PATH
-  1) main                          main      yes     /Users/you/Code/myapp
-  2) billing-redesign              managed   yes     /Users/you/Herd/billing-redesign
-  3) hotfix                        external  no      /Users/you/scratch/hotfix
+  myapp · 3 worktree(s)
 
-1 worktree(s) not in Solo. Select one to add it.
+   #  BRANCH                        TYPE       SOLO  PATH
+   1  main                          main       ✓     ~/Code/myapp
+   2  billing-redesign              managed    ✓     ~/Herd/billing-redesign
+   3  hotfix                        external   ✗     ~/scratch/hotfix
+
+  ✗ 1 not in Solo — select one to add it
 ```
+
+Types are colour-coded (`main` magenta, `managed` green, `external` yellow) and
+paths are shortened to `~`. Colour turns itself off when output is piped, when
+`TERM` is `dumb`, or when `NO_COLOR` is set.
 
 Pick one showing `SOLO no` and choose `[a]dd to Solo`. This registers the
 existing directory only — it does not create a branch, copy a `.env`, or move
@@ -124,7 +130,7 @@ worktree it offers to remove the Solo project only:
 This 'external' worktree is not under /Users/you/Herd,
 so swm will not delete its directory or Git worktree.
 
-Remove its Solo project only, keeping all files? [y/N]:
+  Remove its Solo project only? [y/N, files kept]
 ```
 
 The directory, Git worktree, and branch are all kept — a worktree outside
@@ -177,6 +183,7 @@ otherwise. Override the root with `SWM_ROOT=/another/path`.
 | --- | --- |
 | `SWM_ROOT` | Worktree root directory. |
 | `XDG_CONFIG_HOME` | Location of `swm/projects.conf` (default `~/.config`). |
+| `NO_COLOR` | Disable coloured output. |
 | `SWM_NO_UPDATE_CHECK` | Set to `1` to disable the periodic update check. |
 | `SWM_UPDATE_CHECK_INTERVAL` | Seconds between update checks (default `172800`). |
 

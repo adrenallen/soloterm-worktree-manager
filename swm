@@ -2,13 +2,70 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.4.0"
+SWM_VERSION="1.5.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
 # Resolved here because zsh rebinds $0 to the function name inside a function.
 # :A also follows a symlinked install back to the real file.
 SWM_SCRIPT="${0:A}"
+
+# Styling is dropped for non-terminals, dumb terminals, and NO_COLOR, so piped
+# output and scripted runs stay plain. stdout and stderr are tested separately
+# because either can be redirected on its own.
+swm_color_fd() {
+  [[ -z "${NO_COLOR:-}" ]] || return 1
+  [[ "${TERM:-dumb}" != "dumb" ]] || return 1
+  [[ -t "$1" ]]
+}
+
+if swm_color_fd 1; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'
+  RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'
+  MAG=$'\e[35m'; CYN=$'\e[36m'
+else
+  B="" D="" R="" RED="" GRN="" YLW="" MAG="" CYN=""
+fi
+
+if swm_color_fd 2; then
+  ERED=$'\e[31m'; EDIM=$'\e[2m'; ER=$'\e[0m'
+else
+  ERED="" EDIM="" ER=""
+fi
+
+# Shorten $HOME for display only. Every path swm acts on stays absolute.
+tilde() {
+  print -r -- "${1/#$HOME/~}"
+}
+
+section() {
+  print -r -- "${B}$1${R}"
+}
+
+ok() {
+  print -r -- "  ${GRN}${B}✓${R} ${B}$1${R}"
+}
+
+info() {
+  print -r -- "  ${CYN}${B}▸${R} ${B}$1${R}"
+}
+
+# Aligned label/value row used by every summary block.
+field() {
+  printf "  %s%-8s%s %s\n" "$D" "$1" "$R" "$2"
+}
+
+hint() {
+  print -r -- "${D}$1${R}"
+}
+
+fail() {
+  print -u2 -r -- "${ERED}✗${ER} $1"
+}
+
+detail() {
+  print -u2 -r -- "  ${EDIM}$1${ER}"
+}
 
 usage() {
   print -u2 "Usage: swm"
@@ -27,9 +84,10 @@ usage() {
 }
 
 help_page() {
-  print -r -- "Soloterm Worktree Manager — manage Git worktrees in Solo and Laravel Herd"
   print
-  print -r -- "CREATE"
+  print -r -- "  ${B}swm${R} ${D}${SWM_VERSION}${R} ${D}· Git worktrees in Solo and Laravel Herd${R}"
+  print
+  section "CREATE"
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env|--no-env]"
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
@@ -41,7 +99,7 @@ help_page() {
   print -r -- "  [repository] defaults to the Git repository containing the current"
   print -r -- "  directory."
   print
-  print -r -- "MANAGE"
+  section "MANAGE"
   print -r -- "  swm"
   print -r -- "  swm manage [repository]"
   print
@@ -60,7 +118,7 @@ help_page() {
   print -r -- "  project only. The directory, Git worktree, and branch are kept,"
   print -r -- "  since a worktree outside SWM_ROOT is not swm's to delete."
   print
-  print -r -- "OPTIONS"
+  section "OPTIONS"
   print -r -- "  --with-env"
   print -r -- "      Copy the source repository's ignored .env into the new worktree."
   print -r -- "      APP_NAME is set to the worktree site name. With Herd installed,"
@@ -76,7 +134,7 @@ help_page() {
   print -r -- "  question is skipped when stdin is not a terminal, so scripted runs"
   print -r -- "  never block; pass a flag explicitly there."
   print
-  print -r -- "REMOVE"
+  section "REMOVE"
   print -r -- "  swm remove <worktree-name>"
   print -r -- "  swm rm <worktree-name> --yes"
   print
@@ -85,7 +143,7 @@ help_page() {
   print -r -- "  or force deletion with a typed-name confirmation. The Git branch is"
   print -r -- "  preserved. --yes skips only the normal clean-worktree confirmation."
   print
-  print -r -- "PROJECT DEFAULTS"
+  section "PROJECT DEFAULTS"
   print -r -- "  swm forget [repository]"
   print -r -- ""
   print -r -- "  The first time you create or fork a worktree whose source has a"
@@ -97,7 +155,7 @@ help_page() {
   print -r -- "  \$XDG_CONFIG_HOME/swm/projects.conf (default ~/.config/swm), so"
   print -r -- "  every linked worktree of one clone shares a single setting."
   print
-  print -r -- "UPDATE"
+  section "UPDATE"
   print -r -- "  swm update [--force]"
   print -r -- "  swm version"
   print -r -- ""
@@ -111,24 +169,27 @@ help_page() {
   print -r -- "  prints a one-line notice. The check runs in the background and"
   print -r -- "  reports from a cache, so it never delays a command."
   print
-  print -r -- "PATHS"
+  section "PATHS"
   print -r -- "  With Herd:    \$HOME/Herd/<site-name>"
   print -r -- "  Without Herd: \$HOME/worktrees/<site-name>"
   print -r -- "  Override the root with: SWM_ROOT=/another/path"
   print
-  print -r -- "ENVIRONMENT"
+  section "ENVIRONMENT"
   print -r -- "  SWM_ROOT                     Worktree root directory."
   print -r -- "  SWM_NO_UPDATE_CHECK=1        Disable the periodic update check."
   print -r -- "  SWM_UPDATE_CHECK_INTERVAL    Seconds between checks (default 172800)."
+  print -r -- "  NO_COLOR                     Disable colour. Colour is also off"
+  print -r -- "                               automatically when output is piped or"
+  print -r -- "                               TERM is dumb."
   print
-  print -r -- "EXAMPLES"
+  section "EXAMPLES"
   print -r -- "  swm checkout-redesign dev --with-env"
   print -r -- "  swm api-fix main /path/to/project"
   print -r -- "  swm manage"
   print -r -- "  swm remove checkout-redesign"
   print -r -- "  swm update"
   print
-  print -r -- "REQUIREMENTS"
+  section "REQUIREMENTS"
   print -r -- "  macOS, Zsh, Git, jq, Solo, and Solo's local HTTP API."
   print -r -- "  Laravel Herd is optional. When installed, worktrees are parked and"
   print -r -- "  served at http://<site-name>.<tld>."
@@ -211,7 +272,7 @@ update_swm() {
     return 1
   fi
 
-  print "Checking $SWM_REPOSITORY for updates…"
+  hint "Checking $SWM_REPOSITORY for updates…"
 
   # Stage the download beside the target so the replacement below is a
   # same-filesystem rename rather than a cross-device copy.
@@ -234,7 +295,7 @@ update_swm() {
   autoload -Uz is-at-least
   if [[ "$force" != "--force" ]] && is-at-least "$latest" "$SWM_VERSION"; then
     rm -f -- "$staged"
-    print "Already up to date (swm $SWM_VERSION)."
+    ok "Already up to date (swm $SWM_VERSION)"
     return 0
   fi
 
@@ -255,8 +316,10 @@ update_swm() {
   # Keep the notice from advertising a version that is now installed.
   rm -f -- "$(update_cache_file)"
 
-  print "Updated swm $SWM_VERSION → $latest"
-  print "  $target"
+  print
+  ok "Updated swm ${SWM_VERSION} → ${latest}"
+  field "Path" "$(tilde "$target")"
+  print
 }
 
 # Refresh the cached latest-version marker without blocking this run. The
@@ -308,7 +371,7 @@ check_for_update() {
   if [[ -n "$cached_version" ]]; then
     autoload -Uz is-at-least
     if ! is-at-least "$cached_version" "$SWM_VERSION"; then
-      print -u2 "swm $cached_version is available (installed: $SWM_VERSION). Run: swm update"
+      print -u2 -r -- "${EDIM}swm ${cached_version} is available (installed: ${SWM_VERSION}) — run: swm update${ER}"
       print -u2
     fi
   fi
@@ -407,8 +470,8 @@ forget_project_defaults() {
 
   local current=""
   if ! current="$(project_default "$project_path" "fork-env")"; then
-    print "No remembered defaults for ${project_path:t}."
-    print "  $project_path"
+    info "No remembered defaults for ${project_path:t}"
+    field "Path" "$(tilde "$project_path")"
     return 0
   fi
 
@@ -417,8 +480,9 @@ forget_project_defaults() {
     return 1
   fi
 
-  print "Forgot the .env fork default (was: $current) for ${project_path:t}."
-  print "  $project_path"
+  ok "Forgot the .env default for ${project_path:t}"
+  field "Was" "$current"
+  field "Path" "$(tilde "$project_path")"
 }
 
 has_herd() {
@@ -597,13 +661,15 @@ remove_worktree() {
     if [[ -n "$dirty_state" ]]; then
       local -a dirty_files
       dirty_files=("${(@f)dirty_state}")
-      print -u2 "Worktree has ${#dirty_files} uncommitted or untracked file(s)."
-      print -u2 -- "--yes does not override this safety check."
+      print
+      print -u2 -r -- "${ERED}${B}!${ER} ${B}Worktree has ${#dirty_files} uncommitted or untracked file(s)${ER}"
+      print -u2 -r -- "  ${EDIM}--yes does not override this safety check${ER}"
+      print
 
       while true; do
         local dirty_action=""
-        if ! read "dirty_action?Action: [s]how files, [d]elete anyway, [c]ancel: "; then
-          print "Cancelled."
+        if ! read "dirty_action?  ${B}Action${R} ${D}[s=show, d=delete anyway, c=cancel]${R} "; then
+          hint "  Cancelled."
           return 0
         fi
 
@@ -615,15 +681,15 @@ remove_worktree() {
             ;;
           d|delete|force|"delete anyway")
             print
-            print -u2 "Warning: this permanently deletes these local changes."
+            print -u2 -r -- "${ERED}${B}!${ER} ${ERED}This permanently deletes these local changes.${ER}"
             local typed_name=""
-            if ! read "typed_name?Type '$site_name' to confirm: "; then
-              print "Cancelled."
+            if ! read "typed_name?  ${B}Type '$site_name' to confirm${R} "; then
+              hint "  Cancelled."
               return 0
             fi
 
             if [[ "$typed_name" != "$site_name" ]]; then
-              print "Confirmation did not match. Cancelled."
+              hint "  Confirmation did not match. Cancelled."
               return 0
             fi
 
@@ -631,7 +697,7 @@ remove_worktree() {
             break
             ;;
           c|cancel|q|quit|"")
-            print "Cancelled."
+            hint "  Cancelled."
             return 0
             ;;
           *)
@@ -656,27 +722,36 @@ remove_worktree() {
     return 1
   fi
 
-  print "Cleanup target:"
-  print "  Path:    $worktree_path"
-  [[ -n "$branch_name" ]] && print "  Branch:  $branch_name (branch will be kept)"
+  print
+  info "Cleanup target"
+  field "Path" "$(tilde "$worktree_path")"
+  [[ -n "$branch_name" ]] && field "Branch" "$branch_name ${D}(kept)${R}"
   if [[ -n "$project_id" ]]; then
-    print "  Solo:    project $project_id"
+    field "Solo" "project $project_id"
   else
-    print "  Solo:    already removed"
+    field "Solo" "${D}already removed${R}"
   fi
+  print
 
   if [[ "$confirmation_flag" != "--yes" && "$delete_dirty" != true ]]; then
     local answer=""
-    read "answer?Remove this worktree folder and its Solo project? [y/N]: "
+    read "answer?  ${B}Remove this worktree and its Solo project?${R} ${D}[y/N]${R} "
     if [[ "${answer:l}" != "y" && "${answer:l}" != "yes" ]]; then
-      print "Cancelled."
+      hint "  Cancelled."
       return 0
     fi
   fi
 
   # Stop Solo-managed processes before removing the directory they use.
   if [[ -n "$project_id" ]]; then
-    solo projects delete "$project_id" --confirm-stop-running
+    local delete_output=""
+    if ! delete_output="$(
+      solo projects delete "$project_id" --confirm-stop-running 2>&1
+    )"; then
+      print -u2 -r -- "$delete_output"
+      fail "Could not remove the Solo project."
+      return 1
+    fi
   fi
 
   if [[ -e "$worktree_path" ]]; then
@@ -690,9 +765,11 @@ remove_worktree() {
   fi
 
   print
-  print "Cleanup complete:"
-  print "  Removed: $worktree_path"
-  [[ -n "$branch_name" ]] && print "  Kept branch: $branch_name"
+  ok "Cleanup complete"
+  print
+  field "Removed" "$(tilde "$worktree_path")"
+  [[ -n "$branch_name" ]] && field "Kept" "branch $branch_name"
+  print
 }
 
 manage_worktrees() {
@@ -767,9 +844,14 @@ manage_worktrees() {
   local solo_label=""
   local short_head=""
 
-  print "Worktrees for ${main_path:t}:"
+  local kind_color=""
+  local solo_mark=""
+
   print
-  printf "  %2s  %-28s  %-8s  %-6s  %s\n" "#" "BRANCH" "TYPE" "SOLO" "PATH"
+  print -r -- "  ${B}${main_path:t}${R} ${D}·${R} ${D}${#worktree_paths} worktree(s)${R}"
+  print
+  printf "  %s%2s  %-28s  %-9s  %-4s  %s%s\n" \
+    "$D" "#" "BRANCH" "TYPE" "SOLO" "PATH" "$R"
 
   for (( index = 1; index <= ${#worktree_paths}; ++index )); do
     actual_path="${worktree_paths[$index]}"
@@ -798,12 +880,26 @@ manage_worktrees() {
       worktree_branches[$index]="detached@$short_head"
     fi
 
-    printf "  %2d) %-28s  %-8s  %-6s  %s\n" \
-      "$index" \
-      "${worktree_branches[$index]}" \
-      "$kind" \
-      "$solo_label" \
-      "$actual_path"
+    case "$kind" in
+      main)    kind_color="$MAG" ;;
+      managed) kind_color="$GRN" ;;
+      *)       kind_color="$YLW" ;;
+    esac
+
+    if [[ "$solo_label" == "yes" ]]; then
+      solo_mark="${GRN}✓${R}"
+    else
+      solo_mark="${YLW}✗${R}"
+    fi
+
+    # Colour codes stay in their own printf arguments so the %-Ns widths are
+    # measured against the plain text and the columns still line up.
+    printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%s%s\n" \
+      "$D" "$index" "$R" \
+      "$B" "${worktree_branches[$index]}" "$R" \
+      "$kind_color" "$kind" "$R" \
+      "$solo_mark" \
+      "$D" "$(tilde "$actual_path")" "$R"
   done
 
   local -a missing_from_solo
@@ -811,14 +907,14 @@ manage_worktrees() {
 
   print
   if (( ${#missing_from_solo} > 0 )); then
-    print "${#missing_from_solo} worktree(s) not in Solo. Select one to add it."
+    print -r -- "  ${YLW}✗${R} ${D}${#missing_from_solo} not in Solo — select one to add it${R}"
     print
   fi
 
   local selection=""
-  read "selection?Select a worktree [1-${#worktree_paths}, q]: "
+  read "selection?  ${B}Select${R} ${D}[1-${#worktree_paths}, q]${R} " || selection=""
   if [[ "${selection:l}" == "q" || -z "$selection" ]]; then
-    print "Cancelled."
+    hint "  Cancelled."
     return 0
   fi
 
@@ -840,21 +936,35 @@ manage_worktrees() {
   local selected_in_solo="${worktree_in_solo[$selected_index]}"
 
   print
-  print "Selected: $selected_branch"
-  print "  Path: $selected_path"
-  print "  Solo: $selected_in_solo"
+  info "$selected_branch"
+  field "Path" "$(tilde "$selected_path")"
+  field "Type" "$selected_kind"
+  if [[ "$selected_in_solo" == "yes" ]]; then
+    field "Solo" "${GRN}✓${R} yes"
+  else
+    field "Solo" "${YLW}✗${R} no"
+  fi
   print
   local action=""
+  local choices="f/r/q"
+  print -r -- "  ${D}f${R}  fork into a new worktree"
   if [[ "$selected_in_solo" == "no" ]]; then
-    read "action?Action: [f]ork into a new worktree, [a]dd to Solo, [r]emove, [q]uit: "
-  else
-    read "action?Action: [f]ork into a new worktree, [r]emove, [q]uit: "
+    print -r -- "  ${D}a${R}  add to Solo"
+    choices="f/a/r/q"
   fi
+  if [[ "$selected_kind" == "managed" ]]; then
+    print -r -- "  ${D}r${R}  remove worktree and Solo project"
+  else
+    print -r -- "  ${D}r${R}  remove from Solo only"
+  fi
+  print -r -- "  ${D}q${R}  quit"
+  print
+  read "action?  ${B}Action${R} ${D}[${choices}]${R} " || action=""
 
   case "${action:l}" in
     f|fork)
       local new_name=""
-      read "new_name?New worktree / branch name: "
+      read "new_name?  ${B}New worktree / branch name${R} " || new_name=""
       if [[ -z "$new_name" ]]; then
         print -u2 "A new worktree name is required."
         return 2
@@ -869,16 +979,15 @@ manage_worktrees() {
         if remembered="$(project_default "$main_path" "fork-env")"; then
           if [[ "$remembered" == "yes" ]]; then
             create_command+=("--with-env")
-            print "Copying .env (remembered for ${main_path:t})."
+            hint "  Copying .env (remembered for ${main_path:t}) — undo: swm forget"
           else
             create_command+=("--no-env")
-            print "Not copying .env (remembered for ${main_path:t})."
+            hint "  Not copying .env (remembered for ${main_path:t}) — undo: swm forget"
           fi
-          print "Undo with: swm forget"
         else
           local copy_env=""
           local wants_env="no"
-          read "copy_env?Copy .env and update it for the new worktree? [y/N]: " \
+          read "copy_env?  ${B}Copy .env into the new worktree?${R} ${D}[y/N]${R} " \
             || copy_env=""
           if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
             create_command+=("--with-env")
@@ -889,11 +998,11 @@ manage_worktrees() {
           fi
 
           local remember=""
-          read "remember?Remember this for ${main_path:t} from now on? [y/N]: " \
+          read "remember?  ${B}Remember this for ${main_path:t}?${R} ${D}[y/N]${R} " \
             || remember=""
           if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
             if set_project_default "$main_path" "fork-env" "$wants_env"; then
-              print "Saved. Undo with: swm forget"
+              hint "  Saved — undo: swm forget"
             else
               print -u2 "Warning: could not save to $(project_defaults_file)"
             fi
@@ -919,23 +1028,29 @@ manage_worktrees() {
       local existing_name="$(repository_name "$selected_path")"
       local project_label="${existing_name}: ${selected_branch}"
 
-      if ! solo projects create "$project_label" "$selected_path"; then
-        print -u2 "Solo import failed."
-        print -u2 "Retry with: solo projects create '$project_label' '$selected_path'"
+      local solo_output=""
+      if ! solo_output="$(
+        solo projects create "$project_label" "$selected_path" 2>&1
+      )"; then
+        print -u2 -r -- "$solo_output"
+        fail "Solo import failed."
+        detail "Retry with: solo projects create '$project_label' '$selected_path'"
         return 1
       fi
 
       print
-      print "Added to Solo:"
-      print "  Name:    $project_label"
-      print "  Branch:  $selected_branch"
-      print "  Path:    $selected_path"
+      ok "Added to Solo"
+      print
+      field "Name" "${B}${project_label}${R}"
+      field "Branch" "$selected_branch"
+      field "Path" "$(tilde "$selected_path")"
       # Adding does not park anything, so only advertise a URL that Herd is
       # actually serving.
       if has_herd && [[ "$selected_path" == "$canonical_root"/* ]] \
         && herd_path_is_parked "$canonical_root"; then
-        print "  URL:     http://${selected_path:t}.$(herd tld)"
+        field "URL" "${CYN}http://${selected_path:t}.$(herd tld)${R}"
       fi
+      print
       ;;
     r|remove)
       # Worktrees outside SWM_ROOT are not swm's to delete, but their Solo
@@ -960,30 +1075,36 @@ manage_worktrees() {
 
         print
         local unregister=""
-        read "unregister?Remove its Solo project only, keeping all files? [y/N]: " \
+        read "unregister?  ${B}Remove its Solo project only?${R} ${D}[y/N, files kept]${R} " \
           || unregister=""
         if [[ "${unregister:l}" != "y" && "${unregister:l}" != "yes" ]]; then
-          print "Cancelled."
+          hint "  Cancelled."
           return 0
         fi
 
-        if ! solo projects delete "$project_id" --confirm-stop-running; then
-          print -u2 "Could not remove the Solo project."
+        local delete_output=""
+        if ! delete_output="$(
+          solo projects delete "$project_id" --confirm-stop-running 2>&1
+        )"; then
+          print -u2 -r -- "$delete_output"
+          fail "Could not remove the Solo project."
           return 1
         fi
 
         print
-        print "Removed from Solo:"
-        print "  Project: $project_id"
-        print "  Path:    $selected_path"
-        print "  Kept:    directory, Git worktree, and branch"
+        ok "Removed from Solo"
+        print
+        field "Project" "$project_id"
+        field "Path" "$(tilde "$selected_path")"
+        field "Kept" "directory, Git worktree, and branch"
+        print
         return 0
       fi
 
       remove_worktree "${selected_path:t}" ""
       ;;
     q|quit|"")
-      print "Cancelled."
+      hint "  Cancelled."
       ;;
     *)
       print -u2 "Unknown action: $action"
@@ -1098,11 +1219,11 @@ default_branch_from="$(
 default_branch_from="${default_branch_from:-HEAD}"
 
 if [[ -z "$worktree_name" ]]; then
-  read "worktree_name?Worktree / new branch name: "
+  read "worktree_name?  ${B}Worktree / new branch name${R} " || worktree_name=""
 fi
 
 if [[ -z "$branch_from" ]]; then
-  read "branch_from?Branch from [$default_branch_from]: "
+  read "branch_from?  ${B}Branch from${R} ${D}[$default_branch_from]${R} " || branch_from=""
   branch_from="${branch_from:-$default_branch_from}"
 fi
 
@@ -1121,16 +1242,15 @@ if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; th
     if remembered_env="$(project_default "$project_key" "fork-env")"; then
       if [[ "$remembered_env" == "yes" ]]; then
         with_env=true
-        print "Copying .env (remembered for ${project_key:t})."
+        hint "  Copying .env (remembered for ${project_key:t}) — undo: swm forget"
       else
-        print "Not copying .env (remembered for ${project_key:t})."
+        hint "  Not copying .env (remembered for ${project_key:t}) — undo: swm forget"
       fi
-      print "Undo with: swm forget"
     elif [[ -t 0 ]]; then
       copy_env=""
       wants_env="no"
       # A closed stdin answers No rather than aborting the run.
-      read "copy_env?Copy .env and update it for the new worktree? [y/N]: " \
+      read "copy_env?  ${B}Copy .env into the new worktree?${R} ${D}[y/N]${R} " \
         || copy_env=""
       if [[ "${copy_env:l}" == "y" || "${copy_env:l}" == "yes" ]]; then
         with_env=true
@@ -1138,11 +1258,11 @@ if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; th
       fi
 
       remember=""
-      read "remember?Remember this for ${project_key:t} from now on? [y/N]: " \
+      read "remember?  ${B}Remember this for ${project_key:t}?${R} ${D}[y/N]${R} " \
         || remember=""
       if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
         if set_project_default "$project_key" "fork-env" "$wants_env"; then
-          print "Saved. Undo with: swm forget"
+          hint "  Saved — undo: swm forget"
         else
           print -u2 "Warning: could not save to $(project_defaults_file)"
         fi
@@ -1251,12 +1371,13 @@ if has_herd; then
 
   # Keep custom SWM_ROOT locations working by parking them once when necessary.
   if ! herd_path_is_parked "$canonical_root"; then
-    herd park "$canonical_root"
+    hint "Parking $(tilde "$canonical_root") with Herd…"
+    herd park "$canonical_root" >/dev/null
   fi
 fi
 
-print "Creating branch '$new_branch' from '$start_point'…"
-git -C "$repo" worktree add -b "$new_branch" "$worktree_path" "$start_point"
+hint "Creating branch '$new_branch' from '$start_point'…"
+git -C "$repo" worktree add -q -b "$new_branch" "$worktree_path" "$start_point"
 
 if [[ "$with_env" == true ]]; then
   destination_env="${worktree_path}/.env"
@@ -1285,22 +1406,30 @@ if [[ "$with_env" == true ]]; then
 fi
 
 repo_name="$(repository_name "$repo")"
-if ! solo projects create "${repo_name}: ${new_branch}" "$worktree_path"; then
-  print -u2 "Worktree created, but Solo import failed."
-  print -u2 "Retry with: solo projects create '${repo_name}: ${new_branch}' '$worktree_path'"
+# Solo's own output is captured and only shown when the import fails, so a
+# successful run leaves just swm's summary on screen.
+solo_output=""
+if ! solo_output="$(
+  solo projects create "${repo_name}: ${new_branch}" "$worktree_path" 2>&1
+)"; then
+  print -u2 -r -- "$solo_output"
+  fail "Worktree created, but Solo import failed."
+  detail "Retry with: solo projects create '${repo_name}: ${new_branch}' '$worktree_path'"
   exit 1
 fi
 
 print
-print "Created and added to Solo:"
-print "  Branch:  $new_branch"
-print "  From:    $start_point"
-print "  Path:    $worktree_path"
-[[ -n "$site_url" ]] && print "  URL:     $site_url"
+ok "Created and added to Solo"
+print
+field "Branch" "${B}${new_branch}${R}"
+field "From" "$start_point"
+field "Path" "$(tilde "$worktree_path")"
+[[ -n "$site_url" ]] && field "URL" "${CYN}${site_url}${R}"
 if [[ "$with_env" == true ]]; then
   if [[ -n "$site_url" ]]; then
-    print "  Env:     copied; APP_NAME and APP_URL updated"
+    field "Env" "copied; APP_NAME and APP_URL updated"
   else
-    print "  Env:     copied; APP_NAME updated"
+    field "Env" "copied; APP_NAME updated"
   fi
 fi
+print
