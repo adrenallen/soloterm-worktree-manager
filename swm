@@ -2,7 +2,7 @@
 # Soloterm Worktree Manager
 set -euo pipefail
 
-SWM_VERSION="1.6.0"
+SWM_VERSION="1.7.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -36,6 +36,21 @@ fi
 # Shorten $HOME for display only. Every path swm acts on stays absolute.
 tilde() {
   print -r -- "${1/#$HOME/~}"
+}
+
+# Decorative header for the interactive entry points. Skipped when output is not
+# a terminal, and on dumb terminals that cannot be trusted with box drawing, so
+# pipes and logs stay clean. Returns non-zero when nothing was printed so
+# callers can fall back to a plain title. NO_COLOR still shows it, uncoloured,
+# since that asks for no colour rather than no interface.
+banner() {
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-dumb}" != "dumb" ]] || return 1
+
+  print
+  print -r -- "  ${CYN}┏━┓╻ ╻┏┳┓${R}"
+  print -r -- "  ${CYN}┗━┓┃╻┃┃┃┃${R}  ${D}worktrees, tidied · ${SWM_VERSION}${R}"
+  print -r -- "  ${CYN}┗━┛┗┻┛╹ ╹${R}"
 }
 
 section() {
@@ -85,8 +100,9 @@ usage() {
 }
 
 help_page() {
-  print
-  print -r -- "  ${B}swm${R} ${D}${SWM_VERSION}${R} ${D}· Git worktrees in Solo and Laravel Herd${R}"
+  if ! banner; then
+    print -r -- "swm ${SWM_VERSION} — Git worktrees in Solo and Laravel Herd"
+  fi
   print
   section "CREATE"
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env|--no-env]"
@@ -854,6 +870,8 @@ manage_worktrees() {
 
   local kind_color=""
   local solo_mark=""
+
+  banner || true
 
   print
   print -r -- "  ${B}${main_path:t}${R} ${D}·${R} ${D}${#worktree_paths} worktree(s)${R}"

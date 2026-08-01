@@ -109,6 +109,10 @@ Manage mode lists every worktree in the repository and whether each is already
 a Solo project:
 
 ```
+  ┏━┓╻ ╻┏┳┓
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.7.0
+  ┗━┛┗┻┛╹ ╹
+
   myapp · 3 worktree(s)
 
    #  BRANCH                        TYPE       SOLO  PATH
