@@ -43,9 +43,10 @@ Optional:
   `solo` CLI's table output instead, which produces the same results.
 - **`curl`** — needed by `swm update` and the periodic update check.
 
-`swm` runs under zsh through `#!/usr/bin/env zsh`, so the shell you use
-interactively is irrelevant — bash, fish, nushell, and zsh all invoke it the
-same way. Run `swm health` to see exactly what is present on your machine.
+`swm` declares its own zsh interpreter, so the shell you use interactively is
+irrelevant — bash, fish, nushell, and zsh all invoke it the same way, and none
+of them need configuring. Run `swm health` to see exactly what is present on
+your machine.
 
 ## Install
 
@@ -76,7 +77,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.1
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -168,7 +169,7 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.1
   ┗━┛┗┻┛╹ ╹
 
   myapp · 3 worktree(s)

@@ -1,12 +1,17 @@
-#!/usr/bin/env zsh
+#!/bin/zsh
 # Soloterm Worktree Manager
 #
 # swm runs under zsh regardless of the shell you use interactively, so bash,
-# fish, and friends all invoke it the same way. env is used to find zsh so
-# installs that do not ship /bin/zsh still work.
+# fish, and friends all invoke it the same way.
+#
+# This stays /bin/zsh rather than /usr/bin/env zsh because swm update in 1.7.0
+# and earlier only accepts a download whose first line is exactly "#!/bin/zsh",
+# and changing it would strand every one of those installs. valid_swm_script
+# below now accepts either form, so this can move once 1.8+ is what is out
+# there.
 set -euo pipefail
 
-SWM_VERSION="1.8.0"
+SWM_VERSION="1.8.1"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
