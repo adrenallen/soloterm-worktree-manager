@@ -1,36 +1,51 @@
 # Soloterm Worktree Manager
 
-`swm` turns a branch into an isolated, ready-to-use local development
-environment with one command. It is for developers who want to work on
-multiple features at once without repeatedly setting up folders, local
-domains, environment files, and Solo projects by hand.
+Create and manage Git worktrees that automatically sync to
+[Solo](https://soloterm.com).
 
-When you create a worktree, `swm`:
+![Creating a worktree from swm's manage mode](example1.gif)
 
-1. Creates a new Git branch and linked worktree from `main`, `dev`, another
-   branch, a tag, or a commit.
-2. Places it in a managed worktree root — `$HOME/Herd` when
-   [Laravel Herd](https://herd.laravel.com) is installed, so Herd automatically
-   serves it at `http://<worktree-name>.test`.
-3. Optionally copies the source project's ignored `.env`, then updates
-   `APP_NAME` (and `APP_URL`, when Herd provides a local site URL).
-4. Registers the worktree as a separate project in
-   [Solo](https://soloterm.com), ready for its own commands, terminals, and
-   agents.
-
-It also provides an interactive manager for forking existing worktrees and
-cleanly removing managed worktrees when they are no longer needed.
+- 🌳 **A branch becomes a workspace** — one command creates the branch, the
+  linked worktree, and the folder, all in a managed root.
+- 🖥️ **Solo project, made for you** — every worktree is registered as its own
+  Solo project, named `<repo>: <branch>`, ready for its own commands,
+  terminals, and agents.
+- 🌐 **Knows Laravel Herd** — parks the worktree root and serves each worktree
+  at `http://<name>.test`, with no vhost to write.
+- 🔐 **Brings your `.env`** — copies the ignored `.env` and rewrites `APP_NAME`
+  and `APP_URL` to match the new site. Tracked or non-ignored files are refused.
+- 🧠 **Remembers per project** — answer the `.env` question once and `swm`
+  applies it to that repository from then on.
+- 📥 **Adopts what already exists** — `swm add` registers any directory you
+  already have with Solo, no branch created and nothing moved.
+- 🧹 **Removes cleanly** — deletes the worktree and its Solo project, keeps the
+  branch, and refuses to touch anything it did not create.
+- 🐚 **Works with any shell** — bash, fish, nushell, zsh. `swm` brings its own
+  interpreter, so your shell never has to change.
+- 🩺 **Tells you what's wrong** — `swm health` checks every dependency and
+  `swm health --fix` repairs what it safely can.
+- ⬆️ **Updates itself** — `swm update`, plus a quiet check every couple of days.
 
 ## Requirements
 
-- macOS and Zsh
-- Git and `jq`
-- Solo with its local HTTP API and `solo` CLI enabled
+Required:
 
-[Laravel Herd](https://herd.laravel.com) is optional. When it is installed,
-`swm` parks the worktree root, derives the local TLD, and points `APP_URL` at
-the generated site. Without Herd, worktree creation and Solo registration work
-exactly the same — only the local site URL is skipped.
+- **Git**
+- **Solo**, with its local HTTP API and `solo` CLI enabled
+
+Optional:
+
+- **[Laravel Herd](https://herd.laravel.com)** — when installed, `swm` parks
+  the worktree root, derives the local TLD, and points `APP_URL` at the
+  generated site. Without it, everything else works the same; only the local
+  site URL is skipped.
+- **`jq`** — used to parse Solo's JSON exactly. Without it `swm` reads the
+  `solo` CLI's table output instead, which produces the same results.
+- **`curl`** — needed by `swm update` and the periodic update check.
+
+`swm` runs under zsh through `#!/usr/bin/env zsh`, so the shell you use
+interactively is irrelevant — bash, fish, nushell, and zsh all invoke it the
+same way. Run `swm health` to see exactly what is present on your machine.
 
 ## Install
 
@@ -45,31 +60,48 @@ chmod +x "$HOME/.local/bin/swm"
 Make sure `$HOME/.local/bin` is on your `PATH`, then run:
 
 ```sh
-swm help
+swm health
 ```
 
-## Updating
+## Health check
 
 ```sh
-swm update
+swm health
+swm health --fix
 ```
 
-This downloads the latest `swm` and replaces the installed script in place.
-The download is rejected unless it is a non-empty, syntactically valid `swm`
-script with a version, so a truncated or redirected response cannot overwrite a
-working install. The replacement is a same-directory rename, so updating while
-`swm` is running is safe.
+`swm health` reports every dependency, whether Solo's API is answering, where
+the worktree root is, whether the installed script can update itself, and what
+your terminal supports:
 
-`swm update` refuses to overwrite a package-manager install, and refuses to
-overwrite a Git checkout unless you pass `--force`.
-
-`swm` also checks for a newer version every two days and prints a one-line
-notice. The check runs in the background and reports from a cache, so it never
-delays a command. Disable it with `SWM_NO_UPDATE_CHECK=1`.
-
-```sh
-swm version
 ```
+  ┏━┓╻ ╻┏┳┓
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.0
+  ┗━┛┗┻┛╹ ╹
+
+  REQUIRED
+   ✓  zsh         5.9 /bin/zsh
+   ✓  git         2.50.1 (Apple Git-155)
+   ✓  solo        API ready (2 project(s))
+
+  OPTIONAL
+   ✓  jq          1.7.1-apple (parsing Solo's JSON)
+   ✓  curl        available (swm update)
+   ✓  herd        serving *.test from ~/Herd
+
+  ENVIRONMENT
+   ✓  worktrees   ~/Herd
+   ✓  install     ~/.local/bin/swm (updatable)
+   ✓  config      ~/.config/swm/projects.conf (1 remembered)
+   ✓  terminal    xterm-ghostty (colour, unicode)
+
+  ✓ Ready to use
+```
+
+Only the `REQUIRED` section affects the exit status, so `swm health` is usable
+as a setup check in a script. `--fix` applies the repairs that cannot lose
+anything — creating a missing worktree root, and installing `jq` through an
+existing Homebrew — printing each command before it runs.
 
 ## Quick usage
 
@@ -103,14 +135,40 @@ every operation without remembering any flags.
 `swm manage` is the explicit equivalent. With no repository argument, manage
 mode automatically uses the Git repository containing your current directory.
 
-## Adding an existing worktree to Solo
+Naming a branch to start from is what marks a create as deliberate, so a single
+bare word is treated as a mistyped command rather than a new branch:
 
-Manage mode lists every worktree in the repository and whether each is already
-a Solo project:
+```
+$ swm hlep
+✗ Unknown command: hlep
+  To create a worktree:  swm new
+  Or name the branch:    swm hlep <branch-from>
+  Every command:         swm help
+```
+
+## Adding an existing directory to Solo
+
+```sh
+swm add           # the current directory
+swm add ~/Code/api
+```
+
+Registers the directory with Solo as a project without creating a branch,
+copying a `.env`, or moving anything. Inside a Git checkout it resolves to the
+worktree root, so it works from any subdirectory, and names the project
+`<repo>: <branch>` — the same name worktree creation would have used. A
+directory outside a repository is named after itself. Adding something that is
+already a Solo project reports the existing project and changes nothing.
+
+Useful for worktrees made with plain `git worktree add`, for a clone you want
+in Solo as-is, or for one whose Solo project was deleted.
+
+Manage mode does the same thing interactively. It lists every worktree in the
+repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.7.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.0
   ┗━┛┗┻┛╹ ╹
 
   myapp · 3 worktree(s)
@@ -127,15 +185,10 @@ a Solo project:
 
 Types are colour-coded (`main` magenta, `managed` green, `external` yellow) and
 paths are shortened to `~`. Colour turns itself off when output is piped, when
-`TERM` is `dumb`, or when `NO_COLOR` is set.
+`TERM` is `dumb`, or when `NO_COLOR` is set. On a terminal without a UTF-8
+locale the ticks and box drawing become ASCII rather than mojibake.
 
-Pick one showing `SOLO no` and choose `[a]dd to Solo`. This registers the
-existing directory only — it does not create a branch, copy a `.env`, or move
-anything. The project is named `<repo>: <branch>`, matching what worktree
-creation would have used.
-
-Useful for worktrees made with plain `git worktree add`, or ones whose Solo
-project was deleted.
+Pick one showing `SOLO ✗` and choose `[a]dd to Solo`.
 
 Removing works the same way in reverse. For a worktree under `SWM_ROOT`,
 `[r]emove` deletes the directory and its Solo project. For a **main or external**
@@ -149,7 +202,7 @@ so swm will not delete its directory or Git worktree.
 ```
 
 The directory, Git worktree, and branch are all kept — a worktree outside
-`SWM_ROOT` is not `swm`'s to delete. Re-add it later with `[a]dd to Solo`.
+`SWM_ROOT` is not `swm`'s to delete. Re-add it later with `swm add`.
 
 ## Remembering the .env choice
 
@@ -191,6 +244,29 @@ swm remove checkout-redesign
 
 Worktrees default to `$HOME/Herd` when Herd is installed, and `$HOME/worktrees`
 otherwise. Override the root with `SWM_ROOT=/another/path`.
+
+## Updating
+
+```sh
+swm update
+```
+
+This downloads the latest `swm` and replaces the installed script in place.
+The download is rejected unless it is a non-empty, syntactically valid `swm`
+script with a version, so a truncated or redirected response cannot overwrite a
+working install. The replacement is a same-directory rename, so updating while
+`swm` is running is safe.
+
+`swm update` refuses to overwrite a package-manager install, and refuses to
+overwrite a Git checkout unless you pass `--force`.
+
+`swm` also checks for a newer version every two days and prints a one-line
+notice. The check runs in the background and reports from a cache, so it never
+delays a command. Disable it with `SWM_NO_UPDATE_CHECK=1`.
+
+```sh
+swm version
+```
 
 ## Environment
 

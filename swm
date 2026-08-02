@@ -1,8 +1,12 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # Soloterm Worktree Manager
+#
+# swm runs under zsh regardless of the shell you use interactively, so bash,
+# fish, and friends all invoke it the same way. env is used to find zsh so
+# installs that do not ship /bin/zsh still work.
 set -euo pipefail
 
-SWM_VERSION="1.7.0"
+SWM_VERSION="1.8.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -33,6 +37,43 @@ else
   ERED="" EDIM="" ER=""
 fi
 
+# Ticks, arrows, and box drawing are only legible on a UTF-8 locale; anywhere
+# else they arrive as mojibake, so fall back to ASCII that means the same thing.
+swm_unicode() {
+  local charset="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  [[ "${charset:l}" == *utf-8* || "${charset:l}" == *utf8* ]]
+}
+
+if swm_unicode; then
+  MARK_OK="✓"; MARK_BAD="✗"; MARK_WARN="!"; MARK_ARROW="▸"
+  MARK_TO="→"; DOT="·"; EM="—"
+else
+  MARK_OK="+"; MARK_BAD="x"; MARK_WARN="!"; MARK_ARROW=">"
+  MARK_TO="->"; DOT="-"; EM="-"
+fi
+
+# Prefer the zsh on PATH, but keep working when swm was invoked by absolute
+# path from an environment that does not expose one.
+zsh_interpreter() {
+  if [[ -n "${commands[zsh]:-}" ]]; then
+    print -r -- "${commands[zsh]}"
+  elif [[ -x /bin/zsh ]]; then
+    print -r -- "/bin/zsh"
+  else
+    return 1
+  fi
+}
+
+# BSD (macOS) and GNU coreutils spell the permission-bits format differently,
+# and each rejects the other's flag, so trying both covers either system.
+file_mode() {
+  stat -f '%Lp' -- "$1" 2>/dev/null || stat -c '%a' -- "$1" 2>/dev/null
+}
+
+has_jq() {
+  command -v jq >/dev/null
+}
+
 # Shorten $HOME for display only. Every path swm acts on stays absolute.
 tilde() {
   print -r -- "${1/#$HOME/~}"
@@ -48,8 +89,14 @@ banner() {
   [[ "${TERM:-dumb}" != "dumb" ]] || return 1
 
   print
+  if ! swm_unicode; then
+    # A compact title beats box drawing rendered as mojibake.
+    print -r -- "  ${CYN}${B}swm${R}  ${D}worktrees, tidied - ${SWM_VERSION}${R}"
+    return 0
+  fi
+
   print -r -- "  ${CYN}┏━┓╻ ╻┏┳┓${R}"
-  print -r -- "  ${CYN}┗━┓┃╻┃┃┃┃${R}  ${D}worktrees, tidied · ${SWM_VERSION}${R}"
+  print -r -- "  ${CYN}┗━┓┃╻┃┃┃┃${R}  ${D}worktrees, tidied ${DOT} ${SWM_VERSION}${R}"
   print -r -- "  ${CYN}┗━┛┗┻┛╹ ╹${R}"
 }
 
@@ -58,11 +105,11 @@ section() {
 }
 
 ok() {
-  print -r -- "  ${GRN}${B}✓${R} ${B}$1${R}"
+  print -r -- "  ${GRN}${B}${MARK_OK}${R} ${B}$1${R}"
 }
 
 info() {
-  print -r -- "  ${CYN}${B}▸${R} ${B}$1${R}"
+  print -r -- "  ${CYN}${B}${MARK_ARROW}${R} ${B}$1${R}"
 }
 
 # Aligned label/value row used by every summary block.
@@ -75,7 +122,7 @@ hint() {
 }
 
 fail() {
-  print -u2 -r -- "${ERED}✗${ER} $1"
+  print -u2 -r -- "${ERED}${MARK_BAD}${ER} $1"
 }
 
 detail() {
@@ -87,8 +134,10 @@ usage() {
   print -u2 "       swm [--with-env|--no-env] <worktree-name> <branch-from> [repository]"
   print -u2 "       swm new [repository]"
   print -u2 "       swm manage [repository]"
+  print -u2 "       swm add [path]"
   print -u2 "       swm remove <worktree-name> [--yes]"
   print -u2 "       swm forget [repository]"
+  print -u2 "       swm health [--fix]"
   print -u2 "       swm update [--force]"
   print -u2 "       swm version"
   print -u2 "       swm help"
@@ -101,7 +150,7 @@ usage() {
 
 help_page() {
   if ! banner; then
-    print -r -- "swm ${SWM_VERSION} — Git worktrees in Solo and Laravel Herd"
+    print -r -- "swm ${SWM_VERSION} ${EM} Git worktrees in Solo and Laravel Herd"
   fi
   print
   section "CREATE"
@@ -133,10 +182,8 @@ help_page() {
   print -r -- "  Answer 'n' at the worktree prompt to create a brand new worktree"
   print -r -- "  by answering questions, so plain 'swm' covers every operation."
   print
-  print -r -- "  A worktree listed as SOLO 'no' can be added to Solo as a project."
-  print -r -- "  Adding registers the existing directory only: no branch is created"
-  print -r -- "  and no .env is copied. The project is named \"<repo>: <branch>\","
-  print -r -- "  matching what worktree creation would have used."
+  print -r -- "  A worktree listed as SOLO 'no' can be added to Solo as a project,"
+  print -r -- "  which does the same thing as swm add on that path."
   print
   print -r -- "  Removing a main or external worktree offers to remove its Solo"
   print -r -- "  project only. The directory, Git worktree, and branch are kept,"
@@ -158,6 +205,19 @@ help_page() {
   print -r -- "  question is skipped when stdin is not a terminal, so scripted runs"
   print -r -- "  never block; pass a flag explicitly there."
   print
+  section "ADD"
+  print -r -- "  swm add [path]"
+  print -r -- ""
+  print -r -- "  Register an existing directory with Solo as a project, without"
+  print -r -- "  creating a branch, copying a .env, or moving anything. The path"
+  print -r -- "  defaults to the current directory, and resolves to the worktree"
+  print -r -- "  root when it is inside a Git checkout."
+  print -r -- ""
+  print -r -- "  The project is named \"<repo>: <branch>\", matching what worktree"
+  print -r -- "  creation would have used. A directory outside a repository is"
+  print -r -- "  named after itself. Adding one that is already a Solo project"
+  print -r -- "  reports the existing project and changes nothing."
+  print
   section "REMOVE"
   print -r -- "  swm remove <worktree-name>"
   print -r -- "  swm rm <worktree-name> --yes"
@@ -178,6 +238,13 @@ help_page() {
   print -r -- "  Defaults are keyed by the project's main worktree and stored in"
   print -r -- "  \$XDG_CONFIG_HOME/swm/projects.conf (default ~/.config/swm), so"
   print -r -- "  every linked worktree of one clone shares a single setting."
+  print
+  section "HEALTH"
+  print -r -- "  swm health [--fix]"
+  print -r -- ""
+  print -r -- "  Check everything swm depends on and report what is missing,"
+  print -r -- "  with the command that fixes each one. --fix runs the safe"
+  print -r -- "  repairs itself, showing each command before it runs."
   print
   section "UPDATE"
   print -r -- "  swm update [--force]"
@@ -214,9 +281,10 @@ help_page() {
   print -r -- "  swm update"
   print
   section "REQUIREMENTS"
-  print -r -- "  macOS, Zsh, Git, jq, Solo, and Solo's local HTTP API."
-  print -r -- "  Laravel Herd is optional. When installed, worktrees are parked and"
-  print -r -- "  served at http://<site-name>.<tld>."
+  print -r -- "  Git, Solo, and Solo's local HTTP API. swm brings its own zsh"
+  print -r -- "  interpreter, so the shell you use interactively does not matter."
+  print -r -- "  jq, curl, and Laravel Herd are optional; run swm health to see"
+  print -r -- "  what is present and what each missing piece would add."
 }
 
 site_slug() {
@@ -244,9 +312,13 @@ download_swm() {
 valid_swm_script() {
   local candidate="$1"
   [[ -s "$candidate" ]] || return 1
-  [[ "$(head -1 -- "$candidate")" == "#!/bin/zsh" ]] || return 1
+  # Any zsh shebang: installs have shipped both /bin/zsh and env zsh.
+  [[ "$(head -1 -- "$candidate")" == "#!"*zsh ]] || return 1
   [[ -n "$(script_version "$candidate")" ]] || return 1
-  zsh -n "$candidate" 2>/dev/null || return 1
+
+  local interpreter=""
+  interpreter="$(zsh_interpreter)" || return 1
+  "$interpreter" -n "$candidate" 2>/dev/null || return 1
 }
 
 update_swm() {
@@ -323,7 +395,7 @@ update_swm() {
     return 0
   fi
 
-  if ! chmod "$(stat -f '%Lp' "$target")" "$staged"; then
+  if ! chmod "$(file_mode "$target")" "$staged"; then
     rm -f -- "$staged"
     fail "Could not set permissions on the downloaded script."
     return 1
@@ -395,7 +467,7 @@ check_for_update() {
   if [[ -n "$cached_version" ]]; then
     autoload -Uz is-at-least
     if ! is-at-least "$cached_version" "$SWM_VERSION"; then
-      print -u2 -r -- "${EDIM}swm ${cached_version} is available (installed: ${SWM_VERSION}) — run: swm update${ER}"
+      print -u2 -r -- "${EDIM}swm ${cached_version} is available (installed: ${SWM_VERSION}) ${EM} run: swm update${ER}"
       print -u2
     fi
   fi
@@ -513,24 +585,90 @@ has_herd() {
   command -v herd >/dev/null
 }
 
-# Herd only serves a directory whose parent is parked, so a generated URL is
-# only real once this is true. Requires jq.
+# Solo pages its project list and clamps the page size, so one request can
+# quietly omit projects on a large install. Every page is walked instead.
+SOLO_PAGE_LIMIT=500
+
+# Emit "<id><TAB><path>" for every Solo project, trailing slash trimmed. jq is
+# used when it is installed because it parses Solo's JSON exactly; without it
+# the CLI's tab-separated table gives the same two columns.
+solo_projects() {
+  if has_jq; then
+    solo_projects_via_json
+  else
+    solo_projects_via_table
+  fi
+}
+
+solo_projects_via_json() {
+  local offset=0 page="" next=""
+
+  while true; do
+    page="$(
+      solo projects list --json --limit "$SOLO_PAGE_LIMIT" --offset "$offset"
+    )" || return 1
+
+    print -r -- "$page" \
+      | jq -r '.data.projects[]? | "\(.id)\t\(.path | rtrimstr("/"))"' \
+      || return 1
+
+    next="$(print -r -- "$page" | jq -r '.data.nextOffset // empty')" || return 1
+    # Requiring forward progress keeps an unexpected response from looping.
+    [[ "$next" == <-> ]] && (( next > offset )) || break
+    offset="$next"
+  done
+}
+
+# The table is "ID<TAB>NAME<TAB>DISPLAY NAME<TAB>PATH" under a header row and
+# above a "Showing <n> of <total> projects." footer. Only the first and last
+# columns are read, so a name containing a tab cannot shift the path.
+solo_projects_via_table() {
+  # Not named "path": zsh ties that to $PATH, and a local one empties it.
+  local offset=0 page="" line="" id="" project_path=""
+  local -i emitted=0 page_rows=0 total=0
+  local -a words
+
+  while true; do
+    page="$(
+      solo projects list --limit "$SOLO_PAGE_LIMIT" --offset "$offset"
+    )" || return 1
+
+    page_rows=0
+    for line in "${(@f)page}"; do
+      if [[ "$line" == "Showing "* ]]; then
+        words=(${=line})
+        [[ "${words[4]:-}" == <-> ]] && total="${words[4]}"
+        continue
+      fi
+      [[ "$line" == *$'\t'* ]] || continue
+
+      id="${line%%$'\t'*}"
+      # Skips the header row, whose first column is the literal "ID".
+      [[ "$id" == <-> ]] || continue
+
+      project_path="${line##*$'\t'}"
+      print -r -- "${id}"$'\t'"${project_path%/}"
+      (( ++page_rows, ++emitted ))
+    done
+
+    (( page_rows > 0 && emitted < total )) || break
+    offset=$emitted
+  done
+}
+
 # Print the Solo project id registered at a path. Returns 1 when there is no
 # project and 2 when more than one unexpectedly matches, so callers can tell
 # "nothing to do" apart from "refuse to guess".
 solo_project_id_for() {
-  local projects_json="$1" worktree_path="$2"
+  local projects="$1" worktree_path="${2%/}" line=""
   local -a ids
-  ids=("${(@f)$(
-    print -r -- "$projects_json" \
-      | jq -r --arg path "$worktree_path" \
-          '.data.projects[] | select((.path | rtrimstr("/")) == $path) | .id'
-  )}")
+  ids=()
 
-  # An empty command substitution becomes one empty array item in zsh.
-  if (( ${#ids} == 1 )) && [[ -z "${ids[1]}" ]]; then
-    ids=()
-  fi
+  for line in "${(@f)projects}"; do
+    if [[ "$line" == *$'\t'* && "${line#*$'\t'}" == "$worktree_path" ]]; then
+      ids+=("${line%%$'\t'*}")
+    fi
+  done
 
   if (( ${#ids} > 1 )); then
     fail "Multiple Solo projects unexpectedly match: $worktree_path"
@@ -541,10 +679,41 @@ solo_project_id_for() {
   print -r -- "${ids[1]}"
 }
 
+solo_has_project() {
+  local projects="$1" worktree_path="${2%/}" line=""
+
+  for line in "${(@f)projects}"; do
+    if [[ "$line" == *$'\t'* && "${line#*$'\t'}" == "$worktree_path" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Herd only serves a directory whose parent is parked, so a generated URL is
+# only real once this is true. herd paths prints a JSON array of strings, one
+# per line, which is why the jq-less branch can read it a line at a time.
 herd_path_is_parked() {
-  herd paths \
-    | jq -e --arg root "$1" \
-        'map(rtrimstr("/")) | index($root) != null' >/dev/null
+  local root="${1%/}" paths="" line="" parked=""
+
+  paths="$(herd paths)" || return 1
+
+  if has_jq; then
+    print -r -- "$paths" \
+      | jq -e --arg root "$root" \
+          'map(rtrimstr("/")) | index($root) != null' >/dev/null
+    return $?
+  fi
+
+  for line in "${(@f)paths}"; do
+    [[ "$line" == *\"*\"* ]] || continue
+    parked="${line#*\"}"
+    parked="${parked%\"*}"
+    [[ "${parked%/}" == "$root" ]] && return 0
+  done
+
+  return 1
 }
 
 # Herd users keep the parked $HOME/Herd default. Without Herd, fall back to a
@@ -579,7 +748,7 @@ set_env_value() {
   local env_file="$1"
   local key="$2"
   local value="$3"
-  local original_mode="$(stat -f '%Lp' "$env_file")"
+  local original_mode="$(file_mode "$env_file")"
   local temp_root="${TMPDIR:-/tmp}"
   local temp_file="$(mktemp "${temp_root%/}/swm-env.XXXXXX")"
 
@@ -641,17 +810,17 @@ remove_worktree() {
 
   solo status >/dev/null
 
-  if ! command -v jq >/dev/null; then
-    fail "jq is required to find the matching Solo project."
+  local projects=""
+  if ! projects="$(solo_projects)"; then
+    fail "Could not list Solo projects."
     return 1
   fi
 
-  local projects_json="$(solo projects list --json)"
   local project_id=""
   local lookup_status=0
 
   # Assigned separately because the local builtin would mask the exit status.
-  project_id="$(solo_project_id_for "$projects_json" "$worktree_path")" \
+  project_id="$(solo_project_id_for "$projects" "$worktree_path")" \
     || lookup_status=$?
   if (( lookup_status == 2 )); then
     return 1
@@ -796,6 +965,332 @@ remove_worktree() {
   print
 }
 
+# Register an existing directory with Solo. Nothing on disk is created or
+# changed: no branch, no worktree, no .env, nothing moved. Shared by the
+# "swm add" command and manage mode's [a]dd action.
+add_to_solo() {
+  local target_input="${1:-.}"
+
+  if [[ ! -d "$target_input" ]]; then
+    fail "Not a directory: $target_input"
+    return 1
+  fi
+
+  local target="${target_input:A}"
+  local branch=""
+
+  # Git's own storage is never a project. It is reachable by tab completion,
+  # and --show-toplevel below cannot resolve out of it.
+  if [[ "${target:t}" == ".git" || "$target" == *"/.git/"* ]]; then
+    fail "Refusing to add Git's internal directory: $(tilde "$target")"
+    detail "Run swm add from the worktree itself."
+    return 1
+  fi
+
+  # Registering a subdirectory of a checkout would give Solo a project that is
+  # not the worktree, so resolve to the worktree root first. --show-toplevel is
+  # the probe because --is-inside-work-tree prints "false" and still exits 0.
+  local top=""
+  if top="$(git -C "$target" rev-parse --show-toplevel 2>/dev/null)" \
+    && [[ -n "$top" ]]; then
+    target="${top:A}"
+
+    if ! branch="$(git -C "$target" symbolic-ref --quiet --short HEAD 2>/dev/null)"; then
+      local head_sha=""
+      head_sha="$(git -C "$target" rev-parse --short=8 HEAD 2>/dev/null)" \
+        || head_sha="unknown"
+      branch="detached@${head_sha}"
+    fi
+  fi
+
+  solo status >/dev/null
+
+  local projects=""
+  if ! projects="$(solo_projects)"; then
+    fail "Could not list Solo projects."
+    return 1
+  fi
+
+  local existing_id=""
+  local lookup_status=0
+  existing_id="$(solo_project_id_for "$projects" "$target")" || lookup_status=$?
+  if (( lookup_status == 2 )); then
+    return 1
+  fi
+
+  if (( lookup_status == 0 )); then
+    print
+    info "Already a Solo project"
+    field "Project" "$existing_id"
+    field "Path" "$(tilde "$target")"
+    print
+    return 0
+  fi
+
+  # Named the way worktree creation names things, so one repository's projects
+  # group together in Solo. A directory outside a repository keeps its own name.
+  local project_label=""
+  if [[ -n "$branch" ]]; then
+    project_label="$(repository_name "$target"): ${branch}"
+  else
+    project_label="${target:t}"
+  fi
+
+  local solo_output=""
+  if ! solo_output="$(
+    solo projects create "$project_label" "$target" 2>&1
+  )"; then
+    print -u2 -r -- "$solo_output"
+    fail "Solo import failed."
+    detail "Retry with: solo projects create '$project_label' '$target'"
+    return 1
+  fi
+
+  print
+  ok "Added to Solo"
+  print
+  field "Name" "${B}${project_label}${R}"
+  [[ -n "$branch" ]] && field "Branch" "$branch"
+  field "Path" "$(tilde "$target")"
+
+  # Adding does not park anything, so only advertise a URL Herd really serves.
+  local canonical_root=""
+  canonical_root="${$(default_worktree_root):A}"
+  if has_herd && [[ "$target" == "$canonical_root"/* ]] \
+    && herd_path_is_parked "$canonical_root"; then
+    field "URL" "${CYN}http://${target:t}.$(herd tld)${R}"
+  fi
+  print
+}
+
+typeset -gi HEALTH_PROBLEMS=0
+typeset -gi HEALTH_NOTES=0
+
+# Rows are printed as they are checked so a hang is attributable to the last
+# line on screen. Only REQUIRED failures count towards the exit status.
+health_ok() {
+  printf "   %s%s%s  %-11s %s\n" "$GRN" "$MARK_OK" "$R" "$1" "$2"
+}
+
+health_warn() {
+  printf "   %s%s%s  %-11s %s\n" "$YLW" "$MARK_WARN" "$R" "$1" "$2"
+  (( ++HEALTH_NOTES ))
+}
+
+health_bad() {
+  printf "   %s%s%s  %-11s %s\n" "$RED" "$MARK_BAD" "$R" "$1" "$2"
+  (( ++HEALTH_PROBLEMS ))
+}
+
+health_hint() {
+  print -r -- "      ${D}${MARK_TO} $1${R}"
+}
+
+health_check() {
+  local mode="${1:-}"
+
+  if [[ -n "$mode" && "$mode" != "--fix" ]]; then
+    fail "Unknown option: $mode"
+    print -u2 "Usage: swm health [--fix]"
+    return 2
+  fi
+
+  local fix=false
+  [[ "$mode" == "--fix" ]] && fix=true
+
+  HEALTH_PROBLEMS=0
+  HEALTH_NOTES=0
+  # --fix is limited to repairs that cannot lose anything: creating the
+  # worktree root, and installing optional tools through an existing Homebrew.
+  local fix_root=""
+  local fix_jq=false
+
+  if ! banner; then
+    print -r -- "swm ${SWM_VERSION}"
+  fi
+  print
+
+  section "  REQUIRED"
+
+  autoload -Uz is-at-least
+  local zsh_path=""
+  if ! is-at-least 5.0 "$ZSH_VERSION"; then
+    health_bad "zsh" "$ZSH_VERSION ${D}(swm needs 5.0 or newer)${R}"
+  elif zsh_path="$(zsh_interpreter)"; then
+    health_ok "zsh" "$ZSH_VERSION ${D}$(tilde "$zsh_path")${R}"
+  else
+    # swm is running under zsh either way; update needs a findable one to
+    # syntax-check what it downloads before installing it.
+    health_warn "zsh" "$ZSH_VERSION ${D}(none on PATH; swm update is disabled)${R}"
+  fi
+
+  if command -v git >/dev/null; then
+    local git_version=""
+    git_version="$(git --version 2>/dev/null)" || git_version="unknown version"
+    health_ok "git" "${git_version#git version }"
+  else
+    health_bad "git" "not found"
+    health_hint "install the command line tools: xcode-select --install"
+  fi
+
+  local solo_status_output=""
+  if ! command -v solo >/dev/null; then
+    health_bad "solo" "CLI not found on PATH"
+    health_hint "install Solo from https://soloterm.com and enable its CLI"
+  elif ! solo_status_output="$(solo status 2>&1)"; then
+    health_bad "solo" "CLI found, but its local API is not answering"
+    health_hint "open Solo and enable the local HTTP API in its settings"
+  else
+    local line="" project_count=""
+    for line in "${(@f)solo_status_output}"; do
+      if [[ "$line" == "Projects: "* ]]; then
+        project_count="${line#Projects: }"
+      fi
+    done
+    health_ok "solo" "API ready${project_count:+ ${D}(${project_count} project(s))${R}}"
+  fi
+
+  print
+  section "  OPTIONAL"
+
+  if has_jq; then
+    local jq_version=""
+    jq_version="$(jq --version 2>/dev/null)" || jq_version="unknown version"
+    health_ok "jq" "${jq_version#jq-} ${D}(parsing Solo's JSON)${R}"
+  else
+    health_warn "jq" "not found ${D}(reading Solo's table output instead)${R}"
+    health_hint "for exact JSON parsing: brew install jq"
+    fix_jq=true
+  fi
+
+  if command -v curl >/dev/null; then
+    health_ok "curl" "available ${D}(swm update)${R}"
+  else
+    health_warn "curl" "not found ${D}(swm update and update checks are off)${R}"
+  fi
+
+  local worktree_root=""
+  worktree_root="$(default_worktree_root)"
+  local canonical_root="${worktree_root:A}"
+
+  if has_herd; then
+    local tld=""
+    tld="$(herd tld 2>/dev/null)" || tld=""
+    if [[ -z "$tld" ]]; then
+      health_warn "herd" "installed, but 'herd tld' failed"
+    elif herd_path_is_parked "$canonical_root"; then
+      health_ok "herd" "serving *.${tld} ${D}from $(tilde "$canonical_root")${R}"
+    else
+      health_warn "herd" "$(tilde "$canonical_root") is not parked"
+      health_hint "swm parks it when it next creates a worktree there"
+    fi
+  else
+    health_warn "herd" "not found ${D}(no .test URL, APP_URL left alone)${R}"
+  fi
+
+  print
+  section "  ENVIRONMENT"
+
+  if [[ ! -d "$canonical_root" ]]; then
+    health_warn "worktrees" "$(tilde "$canonical_root") ${D}(does not exist yet)${R}"
+    health_hint "create it: mkdir -p $(tilde "$canonical_root")"
+    fix_root="$canonical_root"
+  elif [[ ! -w "$canonical_root" ]]; then
+    health_bad "worktrees" "$(tilde "$canonical_root") is not writable"
+  else
+    health_ok "worktrees" "$(tilde "$canonical_root")"
+  fi
+
+  local path_swm="${commands[swm]:-}"
+  local updatable="${D}(updatable)${R}"
+  if [[ ! -w "$SWM_SCRIPT" || ! -w "${SWM_SCRIPT:h}" ]]; then
+    updatable="${D}(read-only; swm update cannot replace it)${R}"
+  fi
+
+  if [[ -z "$path_swm" ]]; then
+    health_warn "install" "$(tilde "$SWM_SCRIPT") ${D}(not on PATH)${R}"
+    health_hint "add to your shell profile: export PATH=\"${SWM_SCRIPT:h}:\$PATH\""
+  elif [[ "${path_swm:A}" != "$SWM_SCRIPT" ]]; then
+    health_warn "install" "running $(tilde "$SWM_SCRIPT")"
+    health_hint "PATH resolves swm to $(tilde "${path_swm:A}") instead"
+  else
+    health_ok "install" "$(tilde "$SWM_SCRIPT") ${updatable}"
+  fi
+
+  local defaults_file=""
+  defaults_file="$(project_defaults_file)"
+  local remembered=0
+  if [[ -f "$defaults_file" ]]; then
+    remembered="$(grep -c $'\t' "$defaults_file" 2>/dev/null)" || remembered=0
+  fi
+  health_ok "config" "$(tilde "$defaults_file") ${D}(${remembered} remembered)${R}"
+
+  local terminal_note=""
+  if swm_color_fd 1; then
+    terminal_note="colour"
+  else
+    terminal_note="no colour"
+  fi
+  if swm_unicode; then
+    terminal_note="${terminal_note}, unicode"
+  else
+    terminal_note="${terminal_note}, ascii only"
+  fi
+  health_ok "terminal" "${TERM:-unset} ${D}(${terminal_note})${R}"
+
+  # Snapshotted before the repairs below, which report through the same rows.
+  local -i noted=$HEALTH_NOTES
+
+  if [[ "$fix" == true ]]; then
+    print
+    section "  FIXES"
+
+    local applied=0
+
+    if [[ -n "$fix_root" ]]; then
+      print -r -- "   ${D}\$ mkdir -p $(tilde "$fix_root")${R}"
+      if mkdir -p -- "$fix_root"; then
+        health_ok "worktrees" "created $(tilde "$fix_root")"
+      else
+        health_bad "worktrees" "could not create $(tilde "$fix_root")"
+      fi
+      (( ++applied ))
+    fi
+
+    if [[ "$fix_jq" == true ]]; then
+      if command -v brew >/dev/null; then
+        print -r -- "   ${D}\$ brew install jq${R}"
+        if brew install jq; then
+          health_ok "jq" "installed"
+        else
+          health_bad "jq" "brew install jq did not succeed"
+        fi
+      else
+        health_warn "jq" "Homebrew not found ${D}(install jq yourself)${R}"
+      fi
+      (( ++applied ))
+    fi
+
+    (( applied > 0 )) || hint "   Nothing here can be fixed automatically."
+  elif [[ -n "$fix_root" || "$fix_jq" == true ]]; then
+    print
+    hint "  Some of this can be repaired for you: swm health --fix"
+  fi
+
+  print
+  if (( HEALTH_PROBLEMS > 0 )); then
+    fail "${HEALTH_PROBLEMS} required check(s) failed."
+    print -u2
+    return 1
+  fi
+
+  ok "Ready to use"
+  if (( noted > 0 )); then
+    hint "  ${noted} optional item(s) noted above."
+  fi
+  print
+}
+
 manage_worktrees() {
   local repo_input="${1:-.}"
   local repo=""
@@ -806,14 +1301,14 @@ manage_worktrees() {
     return 1
   fi
 
-  if ! command -v jq >/dev/null; then
-    fail "jq is required for manage mode."
+  solo status >/dev/null
+
+  local projects=""
+  if ! projects="$(solo_projects)"; then
+    fail "Could not list Solo projects."
     return 1
   fi
 
-  solo status >/dev/null
-
-  local projects_json="$(solo projects list --json)"
   local worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
   local -a worktree_paths worktree_heads worktree_branches worktree_kinds
@@ -874,7 +1369,7 @@ manage_worktrees() {
   banner || true
 
   print
-  print -r -- "  ${B}${main_path:t}${R} ${D}·${R} ${D}${#worktree_paths} worktree(s)${R}"
+  print -r -- "  ${B}${main_path:t}${R} ${D}${DOT}${R} ${D}${#worktree_paths} worktree(s)${R}"
   print
   printf "  %s%2s  %-28s  %-9s  %-4s  %s%s\n" \
     "$D" "#" "BRANCH" "TYPE" "SOLO" "PATH" "$R"
@@ -891,10 +1386,7 @@ manage_worktrees() {
     fi
     worktree_kinds+=("$kind")
 
-    if print -r -- "$projects_json" \
-      | jq -e --arg path "$actual_path" \
-          '.data.projects[] | select((.path | rtrimstr("/")) == $path)' \
-          >/dev/null; then
+    if solo_has_project "$projects" "$actual_path"; then
       solo_label="yes"
     else
       solo_label="no"
@@ -913,9 +1405,9 @@ manage_worktrees() {
     esac
 
     if [[ "$solo_label" == "yes" ]]; then
-      solo_mark="${GRN}✓${R}"
+      solo_mark="${GRN}${MARK_OK}${R}"
     else
-      solo_mark="${YLW}✗${R}"
+      solo_mark="${YLW}${MARK_BAD}${R}"
     fi
 
     # Colour codes stay in their own printf arguments so the %-Ns widths are
@@ -933,7 +1425,7 @@ manage_worktrees() {
 
   print
   if (( ${#missing_from_solo} > 0 )); then
-    print -r -- "  ${YLW}✗${R} ${D}${#missing_from_solo} not in Solo — select one to add it${R}"
+    print -r -- "  ${YLW}${MARK_BAD}${R} ${D}${#missing_from_solo} not in Solo ${EM} select one to add it${R}"
     print
   fi
 
@@ -974,9 +1466,9 @@ manage_worktrees() {
   field "Path" "$(tilde "$selected_path")"
   field "Type" "$selected_kind"
   if [[ "$selected_in_solo" == "yes" ]]; then
-    field "Solo" "${GRN}✓${R} yes"
+    field "Solo" "${GRN}${MARK_OK}${R} yes"
   else
-    field "Solo" "${YLW}✗${R} no"
+    field "Solo" "${YLW}${MARK_BAD}${R} no"
   fi
   print
   local action=""
@@ -1013,10 +1505,10 @@ manage_worktrees() {
         if remembered="$(project_default "$main_path" "fork-env")"; then
           if [[ "$remembered" == "yes" ]]; then
             create_command+=("--with-env")
-            hint "  Copying .env (remembered for ${main_path:t}) — undo: swm forget"
+            hint "  Copying .env (remembered for ${main_path:t}) ${EM} undo: swm forget"
           else
             create_command+=("--no-env")
-            hint "  Not copying .env (remembered for ${main_path:t}) — undo: swm forget"
+            hint "  Not copying .env (remembered for ${main_path:t}) ${EM} undo: swm forget"
           fi
         else
           local copy_env=""
@@ -1036,7 +1528,7 @@ manage_worktrees() {
             || remember=""
           if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
             if set_project_default "$main_path" "fork-env" "$wants_env"; then
-              hint "  Saved — undo: swm forget"
+              hint "  Saved ${EM} undo: swm forget"
             else
               print -u2 "Warning: could not save to $(project_defaults_file)"
             fi
@@ -1057,34 +1549,7 @@ manage_worktrees() {
         return 1
       fi
 
-      # Register the existing worktree as-is. Nothing in it is created or
-      # modified, so no branch is made and no .env is copied.
-      local existing_name="$(repository_name "$selected_path")"
-      local project_label="${existing_name}: ${selected_branch}"
-
-      local solo_output=""
-      if ! solo_output="$(
-        solo projects create "$project_label" "$selected_path" 2>&1
-      )"; then
-        print -u2 -r -- "$solo_output"
-        fail "Solo import failed."
-        detail "Retry with: solo projects create '$project_label' '$selected_path'"
-        return 1
-      fi
-
-      print
-      ok "Added to Solo"
-      print
-      field "Name" "${B}${project_label}${R}"
-      field "Branch" "$selected_branch"
-      field "Path" "$(tilde "$selected_path")"
-      # Adding does not park anything, so only advertise a URL that Herd is
-      # actually serving.
-      if has_herd && [[ "$selected_path" == "$canonical_root"/* ]] \
-        && herd_path_is_parked "$canonical_root"; then
-        field "URL" "${CYN}http://${selected_path:t}.$(herd tld)${R}"
-      fi
-      print
+      add_to_solo "$selected_path"
       ;;
     r|remove)
       # Worktrees outside SWM_ROOT are not swm's to delete, but their Solo
@@ -1100,7 +1565,7 @@ manage_worktrees() {
 
         local project_id=""
         local lookup_status=0
-        project_id="$(solo_project_id_for "$projects_json" "$selected_path")" \
+        project_id="$(solo_project_id_for "$projects" "$selected_path")" \
           || lookup_status=$?
         if (( lookup_status != 0 )); then
           print -u2 "Could not identify the Solo project for this worktree."
@@ -1157,6 +1622,17 @@ if [[ "${1:-}" == "help" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+# Dispatched before the update check so a broken install can still be
+# diagnosed without waiting on anything.
+if [[ "${1:-}" == "health" || "${1:-}" == "doctor" ]]; then
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm health [--fix]"
+    exit 2
+  fi
+  health_check "${2:-}"
+  exit $?
+fi
+
 if [[ "${1:-}" == "update" ]]; then
   if (( $# > 2 )); then
     print -u2 "Usage: swm update [--force]"
@@ -1183,6 +1659,15 @@ if [[ "${1:-}" == "manage" ]]; then
     exit 2
   fi
   manage_worktrees "${2:-.}"
+  exit $?
+fi
+
+if [[ "${1:-}" == "add" ]]; then
+  if (( $# > 2 )); then
+    print -u2 "Usage: swm add [path]"
+    exit 2
+  fi
+  add_to_solo "${2:-.}"
   exit $?
 fi
 
@@ -1246,6 +1731,17 @@ fi
 
 if (( ${#create_args} > 3 )); then
   usage
+  exit 2
+fi
+
+# A lone bare word is far more often a mistyped subcommand than a deliberate
+# create, and creating one would leave a new branch behind. Naming the
+# branch-from, or using swm new, says the create was meant.
+if (( ${#create_args} == 1 )) && [[ -n "${create_args[1]}" ]]; then
+  fail "Unknown command: ${create_args[1]}"
+  print -u2 "  To create a worktree:  swm new"
+  print -u2 "  Or name the branch:    swm ${create_args[1]} <branch-from>"
+  print -u2 "  Every command:         swm help"
   exit 2
 fi
 
@@ -1371,9 +1867,9 @@ if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; th
     if remembered_env="$(project_default "$project_key" "fork-env")"; then
       if [[ "$remembered_env" == "yes" ]]; then
         with_env=true
-        hint "  Copying .env (remembered for ${project_key:t}) — undo: swm forget"
+        hint "  Copying .env (remembered for ${project_key:t}) ${EM} undo: swm forget"
       else
-        hint "  Not copying .env (remembered for ${project_key:t}) — undo: swm forget"
+        hint "  Not copying .env (remembered for ${project_key:t}) ${EM} undo: swm forget"
       fi
     elif [[ -t 0 ]]; then
       copy_env=""
@@ -1391,7 +1887,7 @@ if [[ "$with_env" == false && "$without_env" == false && -f "$source_env" ]]; th
         || remember=""
       if [[ "${remember:l}" == "y" || "${remember:l}" == "yes" ]]; then
         if set_project_default "$project_key" "fork-env" "$wants_env"; then
-          hint "  Saved — undo: swm forget"
+          hint "  Saved ${EM} undo: swm forget"
         else
           fail "Could not save to $(project_defaults_file)"
         fi
@@ -1439,7 +1935,8 @@ if [[ "$with_env" == true ]]; then
     exit 1
   fi
 
-  /bin/cp -p "$source_env" "$destination_env"
+  # command bypasses any shell function named cp without assuming /bin/cp.
+  command cp -p "$source_env" "$destination_env"
   set_env_value "$destination_env" "APP_NAME" "\"${site_name}\""
 
   # Without Herd there is no generated local URL, so the copied APP_URL is left
