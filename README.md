@@ -5,7 +5,7 @@ Create and manage Git worktrees that automatically sync to
 
 ![Creating a worktree from swm's manage mode](example1.gif)
 
-- 🌳 **A branch becomes a workspace** — one command creates the branch, the
+- 🌳 **A branch becomes a project** — one command creates the branch, the
   linked worktree, and the folder, all in a managed root.
 - 🖥️ **Solo project, made for you** — every worktree is registered as its own
   Solo project, named `<repo>: <branch>`, ready for its own commands,
