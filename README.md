@@ -79,7 +79,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.10.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.11.0
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -195,7 +195,7 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.10.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.11.0
   ┗━┛┗┻┛╹ ╹
 
   myapp · 4 worktree(s)
@@ -235,6 +235,13 @@ signed in, offline, or the remote is not GitHub, the column is simply left out.
 A branch with several pull requests over its life shows the one that describes
 it now: an open PR outranks a merged one, and a merged one outranks a closed
 one. Selecting a worktree also shows the PR number.
+
+Each state is a **clickable link** to the pull request on terminals that
+support OSC 8 hyperlinks — Ghostty, iTerm2, WezTerm, kitty, VS Code, Windows
+Terminal, and recent VTE-based terminals. Terminals not known to support them
+get plain text instead, and selecting a worktree prints the URL in full so it
+can still be copied. Force the decision either way with `SWM_HYPERLINKS=1` or
+`SWM_HYPERLINKS=0`.
 
 Removing works the same way in reverse. For a worktree under `SWM_ROOT`,
 `[r]emove` deletes the directory and its Solo project. For a **main or external**
@@ -347,6 +354,7 @@ swm version
 | `SWM_ROOT` | Worktree root directory. |
 | `XDG_CONFIG_HOME` | Location of `swm/projects.conf` (default `~/.config`). |
 | `NO_COLOR` | Disable coloured output. |
+| `SWM_HYPERLINKS` | `1` or `0` to force clickable PR links on or off. |
 | `SWM_NO_UPDATE_CHECK` | Set to `1` to disable the periodic update check. |
 | `SWM_UPDATE_CHECK_INTERVAL` | Seconds between update checks (default `172800`). |
 

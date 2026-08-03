@@ -11,7 +11,7 @@
 # there.
 set -euo pipefail
 
-SWM_VERSION="1.10.0"
+SWM_VERSION="1.11.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -47,6 +47,65 @@ fi
 swm_unicode() {
   local charset="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
   [[ "${charset:l}" == *utf-8* || "${charset:l}" == *utf8* ]]
+}
+
+# OSC 8 turns text into a clickable link. Terminals that do not understand the
+# sequence are meant to discard it, but older ones and multiplexers print it as
+# rubbish instead, so this is an allowlist of terminals known to handle it
+# rather than a guess. SWM_HYPERLINKS forces the answer either way.
+hyperlinks_supported() {
+  case "${SWM_HYPERLINKS:-}" in
+    1|yes|true|always) return 0 ;;
+    0|no|false|never)  return 1 ;;
+  esac
+
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-dumb}" != "dumb" ]] || return 1
+
+  # A multiplexer sits between swm and the real terminal and may not pass the
+  # sequence through, and there is no way from here to ask whether it will.
+  [[ -z "${TMUX:-}" ]] || return 1
+  [[ "${TERM}" != screen* && "${TERM}" != tmux* ]] || return 1
+
+  case "${TERM_PROGRAM:-}" in
+    ghostty|iTerm.app|WezTerm|vscode|Hyper|rio|Tabby) return 0 ;;
+    Apple_Terminal) return 1 ;;
+  esac
+
+  case "${TERM}" in
+    xterm-ghostty|xterm-kitty) return 0 ;;
+  esac
+
+  [[ -z "${KITTY_WINDOW_ID:-}" ]] || return 0
+  [[ -z "${WEZTERM_PANE:-}" ]] || return 0
+  [[ -z "${WT_SESSION:-}" ]] || return 0
+  # VTE gained OSC 8 in 0.50, which reports as 5000.
+  [[ "${VTE_VERSION:-}" == <-> ]] && (( VTE_VERSION >= 5000 )) && return 0
+
+  return 1
+}
+
+# Decided once, here, because hyperlink() is called from inside command
+# substitutions where stdout is a pipe: asking "is stdout a terminal" there
+# would answer no every time and silently drop every link.
+if hyperlinks_supported; then
+  LINKS=1
+else
+  LINKS=""
+fi
+
+# Wrap text in an OSC 8 hyperlink, or return it untouched where links would not
+# survive. Callers pad the text to width first, so the escapes never take part
+# in column alignment.
+hyperlink() {
+  local url="$1" text="$2"
+
+  if [[ -z "$url" || -z "$LINKS" ]]; then
+    print -r -- "$text"
+    return 0
+  fi
+
+  print -r -- $'\e]8;;'"${url}"$'\e\\'"${text}"$'\e]8;;\e\\'
 }
 
 if swm_unicode; then
@@ -289,6 +348,11 @@ help_page() {
   print -r -- "  finished work is obvious at a glance. Without gh the column is"
   print -r -- "  simply left out."
   print
+  print -r -- "  On a terminal that supports OSC 8 links, each state is clickable"
+  print -r -- "  and opens the pull request. Terminals not known to support them"
+  print -r -- "  get plain text and the URL in full when a worktree is selected."
+  print -r -- "  Override the guess with SWM_HYPERLINKS=1 or SWM_HYPERLINKS=0."
+  print
   print -r -- "  Answer 'n' at the worktree prompt to create a brand new worktree"
   print -r -- "  by answering questions, so plain 'swm' covers every operation."
   print
@@ -382,6 +446,8 @@ help_page() {
   print -r -- "  NO_COLOR                     Disable colour. Colour is also off"
   print -r -- "                               automatically when output is piped or"
   print -r -- "                               TERM is dumb."
+  print -r -- "  SWM_HYPERLINKS               1 or 0 to force clickable links on"
+  print -r -- "                               or off, instead of detecting."
   print
   section "EXAMPLES"
   print -r -- "  swm checkout-redesign dev --with-env"
@@ -721,11 +787,11 @@ has_gh() {
   command -v gh >/dev/null
 }
 
-# Emit "<branch><TAB><state><TAB><number>" for the repository's pull requests.
-# One request covers every branch, because asking per worktree would be a round
-# trip each. gh carries its own jq, so this adds no external dependency. Every
-# failure -- gh missing, signed out, no GitHub remote, offline -- is reported
-# as "no data" so the listing simply goes without the column.
+# Emit "<branch><TAB><state><TAB><number><TAB><url>" for the repository's pull
+# requests. One request covers every branch, because asking per worktree would
+# be a round trip each. gh carries its own jq, so this adds no external
+# dependency. Every failure -- gh missing, signed out, no GitHub remote,
+# offline -- is reported as "no data" so the listing goes without the column.
 pull_request_rows() {
   has_gh || return 1
 
@@ -733,10 +799,11 @@ pull_request_rows() {
   rows="$(
     cd "$1" 2>/dev/null || exit 1
     gh pr list --state all --limit 200 \
-      --json number,state,isDraft,headRefName \
+      --json number,state,isDraft,headRefName,url \
       --jq '.[] | [.headRefName,
                    (if .isDraft and .state == "OPEN" then "DRAFT" else .state end),
-                   .number] | @tsv' 2>/dev/null
+                   .number,
+                   .url] | @tsv' 2>/dev/null
   )" || return 1
 
   [[ -n "$rows" ]] || return 1
@@ -748,7 +815,7 @@ pull_request_rows() {
 # this branch finished" rather than "what happened most recently".
 pull_request_for() {
   local rows="$1" branch="$2"
-  local line="" name="" state="" number=""
+  local line="" rest="" name="" state="" number="" url=""
   local -i rank=0
   local -i best_rank=99
   local best=""
@@ -757,8 +824,13 @@ pull_request_for() {
     name="${line%%$'\t'*}"
     [[ "$name" == "$branch" ]] || continue
 
-    state="${${line#*$'\t'}%%$'\t'*}"
-    number="${line##*$'\t'}"
+    # Split field by field: a URL can contain anything, so taking the last
+    # field from the end would be the only safe shortcut and there are four.
+    rest="${line#*$'\t'}"
+    state="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+    number="${rest%%$'\t'*}"
+    url="${rest#*$'\t'}"
 
     case "$state" in
       OPEN)   rank=0 ;;
@@ -770,7 +842,7 @@ pull_request_for() {
 
     if (( rank < best_rank )); then
       best_rank=$rank
-      best="${state}"$'\t'"${number}"
+      best="${state}"$'\t'"${number}"$'\t'"${url}"
     fi
   done
 
@@ -1651,7 +1723,7 @@ manage_worktrees() {
   local worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
   local -a worktree_paths worktree_heads worktree_branches worktree_kinds
-  local -a worktree_in_solo worktree_pr_state worktree_pr_number
+  local -a worktree_in_solo worktree_pr_state worktree_pr_number worktree_pr_url
   worktree_paths=()
   worktree_heads=()
   worktree_branches=()
@@ -1659,6 +1731,7 @@ manage_worktrees() {
   worktree_in_solo=()
   worktree_pr_state=()
   worktree_pr_number=()
+  worktree_pr_url=()
 
   local token=""
   local current_path=""
@@ -1756,10 +1829,13 @@ manage_worktrees() {
       solo_mark="${YLW}${MARK_BAD}${R}"
     fi
 
-    local pr_entry="" pr_state="" pr_number="" pr_label="" pr_color=""
+    local pr_entry="" pr_state="" pr_number="" pr_url=""
+    local pr_label="" pr_color="" pr_rest=""
     if pr_entry="$(pull_request_for "$pr_rows" "${worktree_branches[$index]}")"; then
       pr_state="${pr_entry%%$'\t'*}"
-      pr_number="${pr_entry##*$'\t'}"
+      pr_rest="${pr_entry#*$'\t'}"
+      pr_number="${pr_rest%%$'\t'*}"
+      pr_url="${pr_rest#*$'\t'}"
       local pr_style=""
       pr_style="$(pull_request_style "$pr_state")"
       pr_label="${pr_style%%$'\t'*}"
@@ -1770,16 +1846,22 @@ manage_worktrees() {
     fi
     worktree_pr_state+=("$pr_state")
     worktree_pr_number+=("$pr_number")
+    worktree_pr_url+=("$pr_url")
+
+    # Padded to the column width before linking, so the escape sequences never
+    # take part in the alignment printf would otherwise measure.
+    local pr_cell=""
+    pr_cell="$(hyperlink "$pr_url" "${(r:7:)pr_label}")"
 
     # Colour codes stay in their own printf arguments so the %-Ns widths are
     # measured against the plain text and the columns still line up.
     if [[ -n "$pr_rows" ]]; then
-      printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%-7s%s  %s%s%s\n" \
+      printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%s%s  %s%s%s\n" \
         "$D" "$index" "$R" \
         "$B" "${worktree_branches[$index]}" "$R" \
         "$kind_color" "$kind" "$R" \
         "$solo_mark" \
-        "$pr_color" "$pr_label" "$R" \
+        "$pr_color" "$pr_cell" "$R" \
         "$D" "$(tilde "$actual_path")" "$R"
     else
       printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%s%s\n" \
@@ -1864,7 +1946,15 @@ manage_worktrees() {
   if [[ -n "$selected_pr_state" ]]; then
     local selected_style=""
     selected_style="$(pull_request_style "$selected_pr_state")"
-    field "PR" "${selected_style##*$'\t'}#${worktree_pr_number[$selected_index]} ${selected_style%%$'\t'*}${R}"
+    local selected_pr_url="${worktree_pr_url[$selected_index]:-}"
+    local selected_pr_text=""
+    selected_pr_text="#${worktree_pr_number[$selected_index]} ${selected_style%%$'\t'*}"
+    field "PR" "${selected_style##*$'\t'}$(hyperlink "$selected_pr_url" "$selected_pr_text")${R}"
+    # The URL is worth showing plainly too: not every terminal makes links
+    # clickable, and it is the thing you would copy when one does not.
+    if [[ -z "$LINKS" && -n "$selected_pr_url" ]]; then
+      field "" "${D}${selected_pr_url}${R}"
+    fi
   fi
   print
   local action=""
