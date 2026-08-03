@@ -11,7 +11,7 @@
 # there.
 set -euo pipefail
 
-SWM_VERSION="1.11.0"
+SWM_VERSION="1.12.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -317,10 +317,17 @@ help_page() {
   print
   section "CREATE"
   print -r -- "  swm <worktree-name> <branch-from> [repository] [--with-env|--no-env]"
+  print -r -- "  swm <existing-branch> [--with-env|--no-env]"
   print -r -- "  swm new [repository]"
   print
   print -r -- "  swm new asks for everything it needs. It is the same as leaving"
   print -r -- "  the name and branch off, and is what manage mode's 'n' runs."
+  print
+  print -r -- "  A name that already refers to a branch, locally or on origin, is"
+  print -r -- "  checked out into a new worktree instead of created. swm asks"
+  print -r -- "  first, and needs no branch-from, since the branch is its own"
+  print -r -- "  starting point. A branch that exists only on origin is fetched"
+  print -r -- "  and the new local branch is set to track it."
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
   print -r -- "  becomes the folder name, and the Herd site name when Herd is present."
@@ -2220,17 +2227,6 @@ if (( ${#create_args} > 3 )); then
   exit 2
 fi
 
-# A lone bare word is far more often a mistyped subcommand than a deliberate
-# create, and creating one would leave a new branch behind. Naming the
-# branch-from, or using swm new, says the create was meant.
-if (( ${#create_args} == 1 )) && [[ -n "${create_args[1]}" ]]; then
-  fail "Unknown command: ${create_args[1]}"
-  print -u2 "  To create a worktree:  swm new"
-  print -u2 "  Or name the branch:    swm ${create_args[1]} <branch-from>"
-  print -u2 "  Every command:         swm help"
-  exit 2
-fi
-
 worktree_name="${create_args[1]:-}"
 branch_from="${create_args[2]:-}"
 repo_input="${create_args[3]:-.}"
@@ -2246,33 +2242,108 @@ default_branch_from="$(
 default_branch_from="${default_branch_from:-HEAD}"
 
 if [[ -z "$worktree_name" ]]; then
-  read "worktree_name?  ${B}Worktree / new branch name${R} " || worktree_name=""
+  read "worktree_name?  ${B}Worktree / branch name${R} " || worktree_name=""
 fi
 
-if [[ -z "$branch_from" ]]; then
-  read "branch_from?  ${B}Branch from${R} ${D}[$default_branch_from]${R} " || branch_from=""
-  branch_from="${branch_from:-$default_branch_from}"
-fi
-
-if [[ -z "$worktree_name" || -z "$branch_from" ]]; then
-  fail "Both the worktree name and branch-from value are required."
+if [[ -z "$worktree_name" ]]; then
+  fail "A worktree name is required."
   exit 2
 fi
 
-# The requested worktree name is also the new Git branch name.
+# The requested worktree name is also the branch name, whether it is being
+# created or checked out, so it has to be a legal one either way.
 new_branch="$worktree_name"
 git -C "$repo" check-ref-format --branch "$new_branch" >/dev/null
 
+# A name that already refers to a branch is checked out into a new worktree
+# rather than refused. Refusing would send you to git for the exact thing swm
+# exists to do, and there is nothing to create in that case anyway.
+existing_branch=""
 if git -C "$repo" show-ref --verify --quiet "refs/heads/$new_branch"; then
-  fail "Local branch already exists: $new_branch"
-  detail "Choose a new worktree name/branch."
-  exit 1
+  existing_branch="local"
+elif git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$new_branch"; then
+  existing_branch="remote"
+elif git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+  # The branch may exist on the remote without a local ref for it yet, which is
+  # exactly the case where you would want swm to pull it down.
+  if with_spinner "Looking for '$new_branch' on origin…" \
+    git -C "$repo" ls-remote --exit-code --heads origin "refs/heads/$new_branch"; then
+    existing_branch="remote-unfetched"
+  fi
 fi
 
-if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$new_branch"; then
-  fail "Remote branch already exists: origin/$new_branch"
-  detail "Choose a new worktree name/branch."
-  exit 1
+# A lone bare word is usually a mistyped subcommand, and creating from one
+# would leave a new branch behind. A word that names a branch which already
+# exists is not a guess, so only the unrecognised case is refused.
+if [[ -z "$existing_branch" ]] \
+  && (( ${#create_args} == 1 )) && [[ -n "${create_args[1]}" ]]; then
+  fail "Unknown command: ${create_args[1]}"
+  print -u2 "  To create a worktree:  swm new"
+  print -u2 "  Or name the branch:    swm ${create_args[1]} <branch-from>"
+  print -u2 "  Every command:         swm help"
+  exit 2
+fi
+
+if [[ -n "$existing_branch" ]]; then
+  # Checking out a branch that exists needs no start point: the branch is the
+  # start point. Passing one anyway asks for two different things at once.
+  if [[ -n "$branch_from" ]]; then
+    fail "Branch already exists: $new_branch"
+    # The repository is the third argument, so a path here is a slot mistake
+    # rather than someone genuinely asking to branch from a directory.
+    if [[ -d "$branch_from" ]]; then
+      detail "'$branch_from' looks like a repository, which is the third argument."
+      detail "Check the branch out with: swm $new_branch '' $branch_from"
+    else
+      detail "It cannot also be created from '$branch_from'."
+      detail "Drop the branch-from to check the existing branch out: swm $new_branch"
+    fi
+    exit 1
+  fi
+
+  # git allows one branch in one worktree at a time, so say which one has it
+  # rather than letting git's wording land without the path.
+  checked_out_at=""
+  checked_out_at="$(
+    git -C "$repo" worktree list --porcelain \
+      | awk -v b="refs/heads/$new_branch" '
+          /^worktree /  { path = substr($0, 10) }
+          $0 == "branch " b { print path; exit }
+        '
+  )"
+  if [[ -n "$checked_out_at" ]]; then
+    fail "Branch '$new_branch' is already checked out at:"
+    detail "$(tilde "$checked_out_at")"
+    exit 1
+  fi
+
+  case "$existing_branch" in
+    local)  existing_where="a local branch" ;;
+    *)      existing_where="a branch on origin" ;;
+  esac
+
+  print
+  info "$new_branch is ${existing_where}"
+  if [[ -t 0 ]]; then
+    confirm_checkout=""
+    read "confirm_checkout?  ${B}Check it out as a new worktree?${R} ${D}[Y/n]${R} " \
+      || confirm_checkout=""
+    if [[ -n "$confirm_checkout" && "${confirm_checkout:l}" != "y" \
+      && "${confirm_checkout:l}" != "yes" ]]; then
+      hint "  Cancelled."
+      exit 0
+    fi
+  fi
+else
+  if [[ -z "$branch_from" ]]; then
+    read "branch_from?  ${B}Branch from${R} ${D}[$default_branch_from]${R} " || branch_from=""
+    branch_from="${branch_from:-$default_branch_from}"
+  fi
+
+  if [[ -z "$branch_from" ]]; then
+    fail "A branch-from value is required to create a new branch."
+    exit 2
+  fi
 fi
 
 # Herd derives the local hostname from the immediate directory name.
@@ -2306,31 +2377,60 @@ if [[ -e "$worktree_path" ]]; then
   exit 1
 fi
 
-# Refresh simple origin branch names so "dev" and "main" use the latest
-# remote-tracking commit. If fetching is unavailable, fall back to the cached
-# ref and say so.
-if [[ "$branch_from" != */* ]] \
-  && [[ ! "$branch_from" =~ ^[0-9a-fA-F]{7,64}$ ]] \
-  && git -C "$repo" remote get-url origin >/dev/null 2>&1; then
-  print "Refreshing origin/$branch_from…"
-  if ! git -C "$repo" fetch --quiet origin "$branch_from"; then
-    print -u2 "Warning: fetch failed; using the currently available ref."
-  fi
-fi
+start_point=""
 
-# Prefer a named remote branch when both origin/dev and a local dev exist.
-# Explicit refs such as origin/dev, tags, and commit SHAs are used as written.
-if [[ "$branch_from" != */* ]] \
-  && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch_from"; then
-  start_point="origin/$branch_from"
-elif git -C "$repo" rev-parse --verify --quiet "${branch_from}^{commit}" >/dev/null; then
-  start_point="$branch_from"
-elif git -C "$repo" rev-parse --verify --quiet "origin/${branch_from}^{commit}" >/dev/null; then
-  start_point="origin/$branch_from"
+if [[ -n "$existing_branch" ]]; then
+  # Bring the branch down when only the remote has it, so the worktree can be
+  # created from a ref that exists locally.
+  if [[ "$existing_branch" == "remote-unfetched" ]]; then
+    if ! with_spinner "Fetching origin/$new_branch…" \
+      git -C "$repo" fetch --quiet origin \
+        "refs/heads/${new_branch}:refs/remotes/origin/${new_branch}"; then
+      print -u2 -r -- "$SPIN_OUTPUT"
+      fail "Could not fetch origin/$new_branch"
+      exit 1
+    fi
+    existing_branch="remote"
+  elif [[ "$existing_branch" == "remote" ]] \
+    && git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    # Already had the ref, so this only refreshes it; a stale one still works.
+    with_spinner "Refreshing origin/$new_branch…" \
+      git -C "$repo" fetch --quiet origin \
+        "refs/heads/${new_branch}:refs/remotes/origin/${new_branch}" || true
+  fi
+
+  if [[ "$existing_branch" == "local" ]]; then
+    start_point="$new_branch"
+  else
+    start_point="origin/$new_branch"
+  fi
 else
-  fail "Cannot find branch-from ref: $branch_from"
-  detail "Try git fetch first, or pass an explicit ref such as origin/main."
-  exit 1
+  # Refresh simple origin branch names so "dev" and "main" use the latest
+  # remote-tracking commit. If fetching is unavailable, fall back to the cached
+  # ref and say so.
+  if [[ "$branch_from" != */* ]] \
+    && [[ ! "$branch_from" =~ ^[0-9a-fA-F]{7,64}$ ]] \
+    && git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    print "Refreshing origin/$branch_from…"
+    if ! git -C "$repo" fetch --quiet origin "$branch_from"; then
+      print -u2 "Warning: fetch failed; using the currently available ref."
+    fi
+  fi
+
+  # Prefer a named remote branch when both origin/dev and a local dev exist.
+  # Explicit refs such as origin/dev, tags, and commit SHAs are used as written.
+  if [[ "$branch_from" != */* ]] \
+    && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch_from"; then
+    start_point="origin/$branch_from"
+  elif git -C "$repo" rev-parse --verify --quiet "${branch_from}^{commit}" >/dev/null; then
+    start_point="$branch_from"
+  elif git -C "$repo" rev-parse --verify --quiet "origin/${branch_from}^{commit}" >/dev/null; then
+    start_point="origin/$branch_from"
+  else
+    fail "Cannot find branch-from ref: $branch_from"
+    detail "Try git fetch first, or pass an explicit ref such as origin/main."
+    exit 1
+  fi
 fi
 
 # Check Solo before changing the repository so a disabled API cannot leave a
@@ -2417,8 +2517,18 @@ if [[ "$with_env" == true ]]; then
   fi
 fi
 
-hint "Creating branch '$new_branch' from '$start_point'…"
-git -C "$repo" worktree add -q -b "$new_branch" "$worktree_path" "$start_point"
+if [[ "$existing_branch" == "local" ]]; then
+  hint "Checking out existing branch '$new_branch'…"
+  git -C "$repo" worktree add -q "$worktree_path" "$new_branch"
+elif [[ -n "$existing_branch" ]]; then
+  # --track makes the new local branch follow origin/<name>, so pushing and
+  # pulling work without naming the upstream by hand afterwards.
+  hint "Checking out '$start_point' as '$new_branch'…"
+  git -C "$repo" worktree add -q --track -b "$new_branch" "$worktree_path" "$start_point"
+else
+  hint "Creating branch '$new_branch' from '$start_point'…"
+  git -C "$repo" worktree add -q -b "$new_branch" "$worktree_path" "$start_point"
+fi
 
 if [[ "$with_env" == true ]]; then
   destination_env="${worktree_path}/.env"
@@ -2461,10 +2571,20 @@ if ! solo_output="$(
 fi
 
 print
-ok "Created and added to Solo"
+if [[ -n "$existing_branch" ]]; then
+  ok "Checked out and added to Solo"
+else
+  ok "Created and added to Solo"
+fi
 print
 field "Branch" "${B}${new_branch}${R}"
-field "From" "$start_point"
+if [[ "$existing_branch" == "local" ]]; then
+  field "From" "${start_point} ${D}(existing local branch)${R}"
+elif [[ -n "$existing_branch" ]]; then
+  field "From" "${start_point} ${D}(tracking)${R}"
+else
+  field "From" "$start_point"
+fi
 field "Path" "$(tilde "$worktree_path")"
 [[ -n "$site_url" ]] && field "URL" "${CYN}${site_url}${R}"
 if [[ "$site_name_shortened" == true ]]; then

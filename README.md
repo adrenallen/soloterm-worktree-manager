@@ -7,6 +7,8 @@ Create and manage Git worktrees that automatically sync to
 
 - 🌳 **A branch becomes a project** — one command creates the branch, the
   linked worktree, and the folder, all in a managed root.
+- 🌿 **Pulls down branches that already exist** — name a branch on `origin` you
+  have never checked out and `swm` fetches it, tracks it, and sets it up.
 - 🖥️ **Solo project, made for you** — every worktree is registered as its own
   Solo project, named `<repo>: <branch>`, ready for its own commands,
   terminals, and agents.
@@ -79,7 +81,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.11.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.12.0
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -160,10 +162,38 @@ Folder name shortened to the 63-character DNS limit; the branch keeps its full n
 finds the worktree. Two names that differ only past the cut would share a
 folder; that is refused rather than merged, and the error says why.
 
+### Checking out a branch that already exists
+
+Name a branch that already exists — locally, or on `origin` — and `swm` checks
+it out into a new worktree instead of refusing:
+
+```
+$ swm feature/billing-redesign
+
+  ▸ feature/billing-redesign is a branch on origin
+  Check it out as a new worktree? [Y/n]
+
+  ✓ Checked out and added to Solo
+
+  Branch   feature/billing-redesign
+  From     origin/feature/billing-redesign (tracking)
+  Path     ~/Herd/feature-billing-redesign
+```
+
+No branch-from is needed, because the branch is its own starting point. A
+branch that exists only on the remote — one you have never fetched — is found
+with `git ls-remote`, fetched, and the new local branch is set to track it, so
+pushing and pulling work without naming the upstream by hand. Everything else
+is the same: `.env` handling, the Herd site, and the Solo project.
+
+A branch already checked out in another worktree is refused, with the path that
+holds it, since Git allows one branch in one worktree at a time.
+
 ### Typos
 
 Naming a branch to start from is what marks a create as deliberate, so a single
-bare word is treated as a mistyped command rather than a new branch:
+bare word that is **not** an existing branch is treated as a mistyped command
+rather than a new branch:
 
 ```
 $ swm hlep
@@ -195,7 +225,7 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.11.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.12.0
   ┗━┛┗┻┛╹ ╹
 
   myapp · 4 worktree(s)
