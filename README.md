@@ -77,7 +77,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.1
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.0
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -136,6 +136,29 @@ every operation without remembering any flags.
 `swm manage` is the explicit equivalent. With no repository argument, manage
 mode automatically uses the Git repository containing your current directory.
 
+### Long names
+
+The worktree name becomes the branch name as-is. The folder — and the Herd
+hostname derived from it — is capped at the 63-character DNS label limit, so a
+longer name is shortened for the folder rather than refused, and `swm` says so:
+
+```
+$ swm feature/Migrate-The-Entire-Billing-And-Invoicing-Subsystem-To-The-New-API dev
+Folder name shortened to the 63-character DNS limit; the branch keeps its full name.
+
+  ✓ Created and added to Solo
+
+  Branch   feature/Migrate-The-Entire-Billing-And-Invoicing-Subsystem-To-The-New-API
+  Path     ~/Herd/feature-migrate-the-entire-billing-and-invoicing-subsystem-to
+  Folder   shortened to 63 chars (branch name is full)
+```
+
+`swm remove` shortens the same way, so removing by the full original name still
+finds the worktree. Two names that differ only past the cut would share a
+folder; that is refused rather than merged, and the error says why.
+
+### Typos
+
 Naming a branch to start from is what marks a create as deliberate, so a single
 bare word is treated as a mistyped command rather than a new branch:
 
@@ -169,7 +192,7 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.8.1
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.0
   ┗━┛┗┻┛╹ ╹
 
   myapp · 3 worktree(s)

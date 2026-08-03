@@ -11,7 +11,7 @@
 # there.
 set -euo pipefail
 
-SWM_VERSION="1.8.1"
+SWM_VERSION="1.9.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -167,6 +167,8 @@ help_page() {
   print
   print -r -- "  <worktree-name> becomes the new Git branch name. Its DNS-safe form"
   print -r -- "  becomes the folder name, and the Herd site name when Herd is present."
+  print -r -- "  A name longer than a DNS label allows is shortened for the folder"
+  print -r -- "  only, and swm says so; the branch always keeps the full name."
   print
   print -r -- "  <branch-from> may be a branch, tag, commit, or explicit ref. Simple"
   print -r -- "  branch names such as main or dev refresh and prefer origin/<name>."
@@ -292,10 +294,32 @@ help_page() {
   print -r -- "  what is present and what each missing piece would add."
 }
 
-site_slug() {
+# The DNS-safe form of a name, at whatever length it comes out. Callers that
+# need a usable folder or hostname want site_slug instead.
+raw_slug() {
   print -r -- "$1" \
     | tr '[:upper:]_/' '[:lower:]--' \
     | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//'
+}
+
+# A DNS label is capped at 63 characters, and Herd derives the hostname from
+# the folder name, so a longer name is shortened rather than refused. The cap
+# is applied here rather than at each call site so that creating and removing
+# one worktree name always agree on which folder it is.
+SITE_NAME_LIMIT=63
+
+site_slug() {
+  local slug=""
+  slug="$(raw_slug "$1")"
+
+  if (( ${#slug} > SITE_NAME_LIMIT )); then
+    slug="${slug[1,$SITE_NAME_LIMIT]}"
+    # raw_slug collapsed every run of dashes, so the cut can expose at most one
+    # trailing dash, which a DNS label may not end with.
+    slug="${slug%-}"
+  fi
+
+  print -r -- "$slug"
 }
 
 update_cache_file() {
@@ -804,8 +828,10 @@ remove_worktree() {
     return 2
   fi
 
+  # site_slug shortens the same way creation did, so a name that was truncated
+  # on the way in still resolves to its folder on the way out.
   local site_name="$(site_slug "$requested_name")"
-  if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
+  if [[ -z "$site_name" ]]; then
     fail "Invalid worktree name: $requested_name"
     return 1
   fi
@@ -1797,9 +1823,18 @@ fi
 # Herd derives the local hostname from the immediate directory name.
 site_name="$(site_slug "$worktree_name")"
 
-if [[ -z "$site_name" || ${#site_name} -gt 63 ]]; then
-  print -u2 "The worktree name must produce a non-empty DNS label of at most 63 characters."
+if [[ -z "$site_name" ]]; then
+  fail "The worktree name has no characters usable in a folder name: $worktree_name"
+  detail "Use letters, digits, or dashes."
   exit 1
+fi
+
+# The branch keeps the full name; only the folder and hostname are capped, so
+# say which one moved rather than letting the summary look like a typo.
+site_name_shortened=false
+if [[ "$site_name" != "$(raw_slug "$worktree_name")" ]]; then
+  site_name_shortened=true
+  hint "Folder name shortened to the ${SITE_NAME_LIMIT}-character DNS limit; the branch keeps its full name."
 fi
 
 worktree_root="$(default_worktree_root)"
@@ -1807,6 +1842,12 @@ worktree_path="${worktree_root}/${site_name}"
 
 if [[ -e "$worktree_path" ]]; then
   fail "Destination already exists: $worktree_path"
+  # Two names that differ only past the cut share a folder, which looks like a
+  # phantom clash until you know the name was shortened.
+  if [[ "$site_name_shortened" == true ]]; then
+    detail "The shortened folder name collides with an existing worktree."
+    detail "Make the first ${SITE_NAME_LIMIT} characters of the name distinct."
+  fi
   exit 1
 fi
 
@@ -1971,6 +2012,9 @@ field "Branch" "${B}${new_branch}${R}"
 field "From" "$start_point"
 field "Path" "$(tilde "$worktree_path")"
 [[ -n "$site_url" ]] && field "URL" "${CYN}${site_url}${R}"
+if [[ "$site_name_shortened" == true ]]; then
+  field "Folder" "${YLW}shortened${R} to ${SITE_NAME_LIMIT} chars ${D}(branch name is full)${R}"
+fi
 if [[ "$with_env" == true ]]; then
   if [[ -n "$site_url" ]]; then
     field "Env" "copied; APP_NAME and APP_URL updated"
