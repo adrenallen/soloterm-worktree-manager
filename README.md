@@ -77,7 +77,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.1
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -192,7 +192,7 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.0
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.1
   ┗━┛┗┻┛╹ ╹
 
   myapp · 3 worktree(s)

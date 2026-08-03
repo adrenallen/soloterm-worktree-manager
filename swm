@@ -11,7 +11,7 @@
 # there.
 set -euo pipefail
 
-SWM_VERSION="1.9.0"
+SWM_VERSION="1.9.1"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -77,6 +77,20 @@ file_mode() {
 
 has_jq() {
   command -v jq >/dev/null
+}
+
+# Pausing must never be what ends a run. These pauses sit between destructive
+# steps, so aborting on a missing or failing sleep would leave exactly the
+# half-finished state they exist to prevent. zselect is a zsh module and needs
+# no external binary; sleep is the fallback, and neither is allowed to fail.
+swm_sleep() {
+  if zmodload -e zsh/zselect || zmodload zsh/zselect 2>/dev/null; then
+    zselect -t $(( $1 * 100 )) 2>/dev/null || true
+    return 0
+  fi
+
+  command sleep "$1" 2>/dev/null || true
+  return 0
 }
 
 # Shorten $HOME for display only. Every path swm acts on stays absolute.
@@ -860,6 +874,7 @@ remove_worktree() {
   local branch_name=""
   local common_git_dir=""
   local delete_dirty=false
+  local orphaned=false
 
   if [[ -e "$worktree_path" ]]; then
     if [[ ! -d "$worktree_path" || ! -f "$worktree_path/.git" ]]; then
@@ -868,17 +883,28 @@ remove_worktree() {
       return 1
     fi
 
-    local actual_top="$(
+    local actual_top=""
+    actual_top="$(
       git -C "$worktree_path" rev-parse --show-toplevel 2>/dev/null
-    )"
-    actual_top="${actual_top:A}"
+    )" || actual_top=""
 
-    if [[ "$actual_top" != "$worktree_path" ]]; then
+    if [[ -z "$actual_top" ]]; then
+      # Git deletes a worktree's admin directory even when it fails to delete
+      # the files, so a .git pointing at nothing is what a half-finished
+      # removal leaves behind. worktree_path is built from SWM_ROOT, so
+      # finishing that job cannot reach outside the managed root.
+      orphaned=true
+    elif [[ "${actual_top:A}" != "$worktree_path" ]]; then
       print -u2 "Refusing to remove an unexpected Git directory:"
       detail "$worktree_path"
       return 1
     fi
+  fi
 
+  # Git can no longer report on an orphan, and there is nothing left to
+  # preserve: its branch and admin state were dealt with by the run that
+  # stopped part-way.
+  if [[ -e "$worktree_path" && "$orphaned" != true ]]; then
     local dirty_state="$(
       git -C "$worktree_path" status --porcelain --untracked-files=all
     )"
@@ -941,7 +967,11 @@ remove_worktree() {
       cd "$(git rev-parse --git-common-dir)"
       pwd -P
     )"
-  elif [[ -z "$project_id" ]]; then
+  fi
+
+  # An orphan is still worth removing on its own, so this cannot be folded into
+  # the branch above: it must consider the path missing entirely.
+  if [[ ! -e "$worktree_path" && -z "$project_id" ]]; then
     fail "No managed worktree or Solo project found for: $requested_name"
     return 1
   fi
@@ -950,6 +980,10 @@ remove_worktree() {
   info "Cleanup target"
   field "Path" "$(tilde "$worktree_path")"
   [[ -n "$branch_name" ]] && field "Branch" "$branch_name ${D}(kept)${R}"
+  if [[ "$orphaned" == true ]]; then
+    field "State" "${YLW}files left by an interrupted removal${R}"
+    field "Git" "${D}worktree already unregistered; branch already kept${R}"
+  fi
   if [[ -n "$project_id" ]]; then
     field "Solo" "project $project_id"
   else
@@ -959,15 +993,26 @@ remove_worktree() {
 
   if [[ "$confirmation_flag" != "--yes" && "$delete_dirty" != true ]]; then
     local answer=""
-    read "answer?  ${B}Remove this worktree and its Solo project?${R} ${D}[y/N]${R} "
+    if [[ "$orphaned" == true ]]; then
+      read "answer?  ${B}Delete these leftover files?${R} ${D}[y/N]${R} "
+    else
+      read "answer?  ${B}Remove this worktree and its Solo project?${R} ${D}[y/N]${R} "
+    fi
     if [[ "${answer:l}" != "y" && "${answer:l}" != "yes" ]]; then
       hint "  Cancelled."
       return 0
     fi
   fi
 
-  # Stop Solo-managed processes before removing the directory they use.
+  # Stop Solo-managed processes before removing the directory they use. A build
+  # command such as "composer i && npm i" writes thousands of files, and Solo
+  # returns from a stop before its processes have actually exited, so stopping
+  # the commands first and pausing is what keeps Git from deleting a directory
+  # that is being refilled underneath it.
   if [[ -n "$project_id" ]]; then
+    solo commands stop-all --project-id "$project_id" >/dev/null 2>&1 || true
+    swm_sleep 2
+
     local delete_output=""
     if ! delete_output="$(
       solo projects delete "$project_id" --confirm-stop-running 2>&1
@@ -978,12 +1023,59 @@ remove_worktree() {
     fi
   fi
 
-  if [[ -e "$worktree_path" ]]; then
+  if [[ -e "$worktree_path" && "$orphaned" == true ]]; then
+    # Git has no record of this path any more, so only a plain delete is left.
+    if ! rm -rf -- "$worktree_path"; then
+      fail "Could not delete the leftover files:"
+      detail "$(tilde "$worktree_path")"
+      return 1
+    fi
+  elif [[ -e "$worktree_path" ]]; then
     # Path checks plus the confirmations above make --force safe here, while
     # still allowing expected ignored files such as .env to be removed.
-    if ! git --git-dir="$common_git_dir" worktree remove --force "$worktree_path"; then
-      print -u2 "Solo was removed, but Git could not remove the worktree."
-      print -u2 "Resolve the Git error, then run this command again."
+    local attempt=0
+    local removed=false
+    local remove_output=""
+
+    while (( ++attempt <= 3 )); do
+      if git -C "$worktree_path" rev-parse --show-toplevel >/dev/null 2>&1; then
+        if remove_output="$(
+          git --git-dir="$common_git_dir" worktree remove --force "$worktree_path" 2>&1
+        )"; then
+          removed=true
+          break
+        fi
+      else
+        # Git drops its admin directory even when it fails to delete the files,
+        # so from here it can only report "not a working tree" and a plain
+        # delete is all that is left. Removing this worktree is already
+        # confirmed, so finish it rather than strand a directory Git can no
+        # longer describe.
+        if remove_output="$(rm -rf -- "$worktree_path" 2>&1)"; then
+          removed=true
+          break
+        fi
+      fi
+
+      (( attempt < 3 )) || break
+      hint "  Something is still writing to the worktree; retrying…"
+      swm_sleep 2
+    done
+
+    if [[ "$removed" != true ]]; then
+      print -u2 -r -- "$remove_output"
+
+      # The two failures leave very different states and only one of them can
+      # be retried as-is. Saying "run it again" for both is how a worktree ends
+      # up stuck with no command that will finish it.
+      if git -C "$worktree_path" rev-parse --show-toplevel >/dev/null 2>&1; then
+        fail "Solo was removed, but Git could not remove the worktree."
+        detail "Stop whatever is writing to it, then run this command again."
+      else
+        fail "Solo and the Git worktree are gone, but these files could not be deleted:"
+        detail "$(tilde "$worktree_path")"
+        detail "Remove them yourself, or fix what is holding them and run this again."
+      fi
       return 1
     fi
   fi
