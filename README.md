@@ -42,6 +42,8 @@ Optional:
 - **`jq`** — used to parse Solo's JSON exactly. Without it `swm` reads the
   `solo` CLI's table output instead, which produces the same results.
 - **`curl`** — needed by `swm update` and the periodic update check.
+- **[`gh`](https://cli.github.com)** — the GitHub CLI, signed in. Adds a pull
+  request column to manage mode. Without it the column is left out.
 
 `swm` declares its own zsh interpreter, so the shell you use interactively is
 irrelevant — bash, fish, nushell, and zsh all invoke it the same way, and none
@@ -77,7 +79,7 @@ your terminal supports:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.1
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.10.0
   ┗━┛┗┻┛╹ ╹
 
   REQUIRED
@@ -88,6 +90,7 @@ your terminal supports:
   OPTIONAL
    ✓  jq          1.7.1-apple (parsing Solo's JSON)
    ✓  curl        available (swm update)
+   ✓  gh          signed in (pull request status in manage)
    ✓  herd        serving *.test from ~/Herd
 
   ENVIRONMENT
@@ -192,19 +195,22 @@ repository and whether each is already a Solo project:
 
 ```
   ┏━┓╻ ╻┏┳┓
-  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.9.1
+  ┗━┓┃╻┃┃┃┃  worktrees, tidied · 1.10.0
   ┗━┛┗┻┛╹ ╹
 
-  myapp · 3 worktree(s)
+  myapp · 4 worktree(s)
 
-   #  BRANCH                        TYPE       SOLO  PATH
-   1  main                          main       ✓     ~/Code/myapp
-   2  billing-redesign              managed    ✓     ~/Herd/billing-redesign
-   3  hotfix                        external   ✗     ~/scratch/hotfix
+   #  BRANCH                        TYPE       SOLO  PR       PATH
+   1  main                          main       ✓     -        ~/Code/myapp
+   2  billing-redesign              managed    ✓     merged   ~/Herd/billing-redesign
+   3  checkout-fix                  managed    ✓     open     ~/Herd/checkout-fix
+   4  hotfix                        external   ✗     -        ~/scratch/hotfix
 
   ✗ 1 not in Solo — select one to add it
 
-  Select [1-3, n=new, q]
+  ✓ 1 merged — done with, safe to remove
+
+  Select [1-4, n=new, q]
 ```
 
 Types are colour-coded (`main` magenta, `managed` green, `external` yellow) and
@@ -213,6 +219,22 @@ paths are shortened to `~`. Colour turns itself off when output is piped, when
 locale the ticks and box drawing become ASCII rather than mojibake.
 
 Pick one showing `SOLO ✗` and choose `[a]dd to Solo`.
+
+### Pull request status
+
+With [`gh`](https://cli.github.com) installed and signed in, each branch shows
+the state of its pull request — `open`, `draft`, `merged`, or `closed` — so the
+branches you are finished with are obvious without leaving the terminal. The
+count of merged worktrees is called out separately, since those are the ones
+worth removing.
+
+It is one request for the whole repository rather than one per branch, and `gh`
+carries its own `jq`, so this adds no other dependency. If `gh` is missing, not
+signed in, offline, or the remote is not GitHub, the column is simply left out.
+
+A branch with several pull requests over its life shows the one that describes
+it now: an open PR outranks a merged one, and a merged one outranks a closed
+one. Selecting a worktree also shows the PR number.
 
 Removing works the same way in reverse. For a worktree under `SWM_ROOT`,
 `[r]emove` deletes the directory and its Solo project. For a **main or external**
@@ -227,6 +249,32 @@ so swm will not delete its directory or Git worktree.
 
 The directory, Git worktree, and branch are all kept — a worktree outside
 `SWM_ROOT` is not `swm`'s to delete. Re-add it later with `swm add`.
+
+### Removing the worktree you are standing in
+
+This works. `swm` steps out of the directory before deleting it, and tells you
+where your shell is left:
+
+```
+  ✓ Cleanup complete
+
+  Removed  ~/Herd/billing-redesign
+  Kept     branch billing-redesign
+  Note     your shell is still in the removed directory
+  Run      cd ~/Code/myapp
+```
+
+Your shell keeps a deleted working directory until you `cd` somewhere — no
+process can change another one's directory, so that last step is yours.
+
+Removing a Solo project stops every process in it, including the terminal you
+may be running `swm` from. That is why the worktree is deleted first and the
+Solo project unregistered last: by the time anything can close your session,
+the removal is already finished. When it would close the session you are in,
+the summary says so before you confirm.
+
+Deleting a worktree with a large `node_modules` takes a while, so each step
+shows a progress indicator with an elapsed count rather than sitting silent.
 
 ## Remembering the .env choice
 

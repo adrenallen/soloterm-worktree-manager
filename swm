@@ -11,7 +11,7 @@
 # there.
 set -euo pipefail
 
-SWM_VERSION="1.9.1"
+SWM_VERSION="1.10.0"
 SWM_REPOSITORY="adrenallen/soloterm-worktree-manager"
 SWM_SOURCE_URL="https://raw.githubusercontent.com/${SWM_REPOSITORY}/main/swm"
 
@@ -79,18 +79,102 @@ has_jq() {
   command -v jq >/dev/null
 }
 
+has_zselect() {
+  zmodload -e zsh/zselect || zmodload zsh/zselect 2>/dev/null
+}
+
 # Pausing must never be what ends a run. These pauses sit between destructive
 # steps, so aborting on a missing or failing sleep would leave exactly the
 # half-finished state they exist to prevent. zselect is a zsh module and needs
 # no external binary; sleep is the fallback, and neither is allowed to fail.
 swm_sleep() {
-  if zmodload -e zsh/zselect || zmodload zsh/zselect 2>/dev/null; then
+  if has_zselect; then
     zselect -t $(( $1 * 100 )) 2>/dev/null || true
     return 0
   fi
 
   command sleep "$1" 2>/dev/null || true
   return 0
+}
+
+# Animation needs a sub-second pause that reliably pauses. Without zselect a
+# failed fractional sleep would spin the frame loop at full speed, so its
+# absence turns the animation off rather than risking a busy loop.
+swm_can_animate() {
+  [[ -t 1 ]] || return 1
+  [[ "${TERM:-dumb}" != "dumb" ]] || return 1
+  has_zselect
+}
+
+# Set by with_spinner to the finished command's combined output.
+SPIN_OUTPUT=""
+
+# Run a command while showing an animated line, and return its exit status.
+# Removing a worktree means stopping Solo's processes and deleting tens of
+# thousands of files, which is many silent seconds; without this it reads as a
+# hang. Output is captured and left in SPIN_OUTPUT so it cannot interleave with
+# the animation, and the elapsed count makes a slow step visibly still moving.
+with_spinner() {
+  local message="$1"
+  shift
+
+  if ! swm_can_animate; then
+    SPIN_OUTPUT="$("$@" 2>&1)"
+    return $?
+  fi
+
+  local -a frames
+  if swm_unicode; then
+    frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  else
+    frames=('|' '/' '-' '\')
+  fi
+
+  local captured=""
+  if ! captured="$(mktemp "${TMPDIR:-/tmp}/swm-spin.XXXXXX")"; then
+    SPIN_OUTPUT="$("$@" 2>&1)"
+    return $?
+  fi
+
+  "$@" >"$captured" 2>&1 &
+  local job=$!
+
+  local -i frame=0
+  local -i started=$SECONDS
+  local -i elapsed=0
+  local age=""
+
+  while kill -0 "$job" 2>/dev/null; do
+    elapsed=$(( SECONDS - started ))
+    # Only worth showing once a step has lasted long enough to worry about.
+    if (( elapsed >= 3 )); then
+      age=" ${D}(${elapsed}s)${R}"
+    fi
+    printf "\r  %s%s%s %s%s" \
+      "$CYN" "${frames[$(( frame % ${#frames} + 1 ))]}" "$R" "$message" "$age"
+    (( ++frame ))
+
+    # zselect reports a non-zero status when its timeout expires, which is the
+    # normal outcome for a pure pause and says nothing about whether it worked.
+    zselect -t 8 2>/dev/null || true
+
+    # Belt and braces: if the pause is somehow not pausing, stop drawing rather
+    # than spin a core for the length of the deletion.
+    if (( frame > 200 && SECONDS == started )); then
+      break
+    fi
+  done
+
+  # Not named "status": zsh makes that read-only, and a local one aborts.
+  local -i command_status=0
+  wait "$job" || command_status=$?
+
+  # Wipe the line so the result prints into clean space.
+  printf "\r\e[2K"
+
+  SPIN_OUTPUT="$(<"$captured")"
+  rm -f -- "$captured"
+  return $command_status
 }
 
 # Shorten $HOME for display only. Every path swm acts on stays absolute.
@@ -200,6 +284,11 @@ help_page() {
   print -r -- "  .env, or remove a worktree managed under SWM_ROOT."
   print -r -- "  Only worktrees under SWM_ROOT can be deleted outright."
   print
+  print -r -- "  With the GitHub CLI installed and signed in, each branch also"
+  print -r -- "  shows its pull request state (open, draft, merged, closed) so"
+  print -r -- "  finished work is obvious at a glance. Without gh the column is"
+  print -r -- "  simply left out."
+  print
   print -r -- "  Answer 'n' at the worktree prompt to create a brand new worktree"
   print -r -- "  by answering questions, so plain 'swm' covers every operation."
   print
@@ -304,8 +393,8 @@ help_page() {
   section "REQUIREMENTS"
   print -r -- "  Git, Solo, and Solo's local HTTP API. swm brings its own zsh"
   print -r -- "  interpreter, so the shell you use interactively does not matter."
-  print -r -- "  jq, curl, and Laravel Herd are optional; run swm health to see"
-  print -r -- "  what is present and what each missing piece would add."
+  print -r -- "  jq, curl, gh, and Laravel Herd are optional; run swm health to"
+  print -r -- "  see what is present and what each missing piece would add."
 }
 
 # The DNS-safe form of a name, at whatever length it comes out. Callers that
@@ -628,6 +717,78 @@ has_herd() {
   command -v herd >/dev/null
 }
 
+has_gh() {
+  command -v gh >/dev/null
+}
+
+# Emit "<branch><TAB><state><TAB><number>" for the repository's pull requests.
+# One request covers every branch, because asking per worktree would be a round
+# trip each. gh carries its own jq, so this adds no external dependency. Every
+# failure -- gh missing, signed out, no GitHub remote, offline -- is reported
+# as "no data" so the listing simply goes without the column.
+pull_request_rows() {
+  has_gh || return 1
+
+  local rows=""
+  rows="$(
+    cd "$1" 2>/dev/null || exit 1
+    gh pr list --state all --limit 200 \
+      --json number,state,isDraft,headRefName \
+      --jq '.[] | [.headRefName,
+                   (if .isDraft and .state == "OPEN" then "DRAFT" else .state end),
+                   .number] | @tsv' 2>/dev/null
+  )" || return 1
+
+  [[ -n "$rows" ]] || return 1
+  print -r -- "$rows"
+}
+
+# A branch can carry several pull requests over its life. An open one describes
+# it best, then a merged one, and a closed one last, so the column answers "is
+# this branch finished" rather than "what happened most recently".
+pull_request_for() {
+  local rows="$1" branch="$2"
+  local line="" name="" state="" number=""
+  local -i rank=0
+  local -i best_rank=99
+  local best=""
+
+  for line in "${(@f)rows}"; do
+    name="${line%%$'\t'*}"
+    [[ "$name" == "$branch" ]] || continue
+
+    state="${${line#*$'\t'}%%$'\t'*}"
+    number="${line##*$'\t'}"
+
+    case "$state" in
+      OPEN)   rank=0 ;;
+      DRAFT)  rank=1 ;;
+      MERGED) rank=2 ;;
+      CLOSED) rank=3 ;;
+      *)      rank=4 ;;
+    esac
+
+    if (( rank < best_rank )); then
+      best_rank=$rank
+      best="${state}"$'\t'"${number}"
+    fi
+  done
+
+  [[ -n "$best" ]] || return 1
+  print -r -- "$best"
+}
+
+# Lowercase label and colour for a pull request state.
+pull_request_style() {
+  case "$1" in
+    OPEN)   print -r -- "open"$'\t'"$GRN" ;;
+    DRAFT)  print -r -- "draft"$'\t'"$D" ;;
+    MERGED) print -r -- "merged"$'\t'"$MAG" ;;
+    CLOSED) print -r -- "closed"$'\t'"$RED" ;;
+    *)      print -r -- "${1:l}"$'\t'"$D" ;;
+  esac
+}
+
 # Solo pages its project list and clamps the page size, so one request can
 # quietly omit projects on a large install. Every page is walked instead.
 SOLO_PAGE_LIMIT=500
@@ -826,6 +987,15 @@ set_env_value() {
   fi
 }
 
+# Stop a project's commands and let them finish exiting. Solo returns from a
+# stop before its processes are gone, and a build such as "composer i && npm i"
+# keeps writing for a while after, which is what makes Git delete a directory
+# that is being refilled underneath it.
+quiesce_solo_project() {
+  solo commands stop-all --project-id "$1" >/dev/null 2>&1 || true
+  swm_sleep 2
+}
+
 remove_worktree() {
   local requested_name="${1:-}"
   local confirmation_flag="${2:-}"
@@ -875,6 +1045,8 @@ remove_worktree() {
   local common_git_dir=""
   local delete_dirty=false
   local orphaned=false
+  local vacated_cwd=""
+  local return_to="$canonical_root"
 
   if [[ -e "$worktree_path" ]]; then
     if [[ ! -d "$worktree_path" || ! -f "$worktree_path/.git" ]]; then
@@ -989,6 +1161,11 @@ remove_worktree() {
   else
     field "Solo" "${D}already removed${R}"
   fi
+  # Removing a Solo project stops every process in it, so running this from one
+  # of that project's own terminals ends the session it is running in.
+  if [[ -n "$project_id" && "${SOLO_PROJECT_ID:-}" == "$project_id" ]]; then
+    field "Note" "${YLW}closes this Solo session${R} ${D}(removal finishes first)${R}"
+  fi
   print
 
   if [[ "$confirmation_flag" != "--yes" && "$delete_dirty" != true ]]; then
@@ -1009,23 +1186,27 @@ remove_worktree() {
   # returns from a stop before its processes have actually exited, so stopping
   # the commands first and pausing is what keeps Git from deleting a directory
   # that is being refilled underneath it.
+  # stop-all only stops command processes, so the terminal or agent running swm
+  # survives this and the build that would race the deletion does not.
   if [[ -n "$project_id" ]]; then
-    solo commands stop-all --project-id "$project_id" >/dev/null 2>&1 || true
-    swm_sleep 2
+    with_spinner "Stopping Solo processes…" quiesce_solo_project "$project_id"
+  fi
 
-    local delete_output=""
-    if ! delete_output="$(
-      solo projects delete "$project_id" --confirm-stop-running 2>&1
-    )"; then
-      print -u2 -r -- "$delete_output"
-      fail "Could not remove the Solo project."
-      return 1
+  # Standing in the directory about to be deleted leaves every later command
+  # with a cwd that no longer exists. swm can move its own; the calling shell
+  # keeps a deleted cwd until the user changes it, which is reported at the end.
+  if [[ "$PWD/" == "$worktree_path/"* ]]; then
+    vacated_cwd="$worktree_path"
+    if [[ "${common_git_dir:t}" == ".git" && -d "${common_git_dir:h}" ]]; then
+      return_to="${common_git_dir:h}"
     fi
+    cd -- "$return_to" 2>/dev/null || cd /
   fi
 
   if [[ -e "$worktree_path" && "$orphaned" == true ]]; then
     # Git has no record of this path any more, so only a plain delete is left.
-    if ! rm -rf -- "$worktree_path"; then
+    if ! with_spinner "Deleting leftover files…" rm -rf -- "$worktree_path"; then
+      print -u2 -r -- "$SPIN_OUTPUT"
       fail "Could not delete the leftover files:"
       detail "$(tilde "$worktree_path")"
       return 1
@@ -1039,22 +1220,23 @@ remove_worktree() {
 
     while (( ++attempt <= 3 )); do
       if git -C "$worktree_path" rev-parse --show-toplevel >/dev/null 2>&1; then
-        if remove_output="$(
-          git --git-dir="$common_git_dir" worktree remove --force "$worktree_path" 2>&1
-        )"; then
+        if with_spinner "Removing the worktree…" \
+          git --git-dir="$common_git_dir" worktree remove --force "$worktree_path"; then
           removed=true
           break
         fi
+        remove_output="$SPIN_OUTPUT"
       else
         # Git drops its admin directory even when it fails to delete the files,
         # so from here it can only report "not a working tree" and a plain
         # delete is all that is left. Removing this worktree is already
         # confirmed, so finish it rather than strand a directory Git can no
         # longer describe.
-        if remove_output="$(rm -rf -- "$worktree_path" 2>&1)"; then
+        if with_spinner "Deleting remaining files…" rm -rf -- "$worktree_path"; then
           removed=true
           break
         fi
+        remove_output="$SPIN_OUTPUT"
       fi
 
       (( attempt < 3 )) || break
@@ -1080,11 +1262,28 @@ remove_worktree() {
     fi
   fi
 
+  # Unregistering the project stops every process in it, including the terminal
+  # or agent swm may itself be running in, so it goes last: by the time this can
+  # cut the session off, the removal it was asked to do is already finished.
+  if [[ -n "$project_id" ]]; then
+    if ! with_spinner "Removing the Solo project…" \
+      solo projects delete "$project_id" --confirm-stop-running; then
+      print -u2 -r -- "$SPIN_OUTPUT"
+      fail "The worktree was removed, but its Solo project was not."
+      detail "Remove it in Solo, or run: solo projects delete $project_id"
+      return 1
+    fi
+  fi
+
   print
   ok "Cleanup complete"
   print
   field "Removed" "$(tilde "$worktree_path")"
   [[ -n "$branch_name" ]] && field "Kept" "branch $branch_name"
+  if [[ -n "$vacated_cwd" ]]; then
+    field "Note" "${YLW}your shell is still in the removed directory${R}"
+    field "Run" "cd $(tilde "$return_to")"
+  fi
   print
 }
 
@@ -1292,6 +1491,16 @@ health_check() {
     health_warn "curl" "not found ${D}(swm update and update checks are off)${R}"
   fi
 
+  if ! has_gh; then
+    health_warn "gh" "not found ${D}(no pull request column in manage)${R}"
+    health_hint "for PR status per branch: brew install gh && gh auth login"
+  elif ! gh auth status >/dev/null 2>&1; then
+    health_warn "gh" "installed, but not signed in"
+    health_hint "sign in to show pull request status: gh auth login"
+  else
+    health_ok "gh" "signed in ${D}(pull request status in manage)${R}"
+  fi
+
   local worktree_root=""
   worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
@@ -1432,15 +1641,24 @@ manage_worktrees() {
     return 1
   fi
 
+  # with_spinner runs its command in a background job, so the rows have to come
+  # back as output rather than through a variable the job cannot export.
+  local pr_rows=""
+  if with_spinner "Checking pull requests…" pull_request_rows "$repo"; then
+    pr_rows="$SPIN_OUTPUT"
+  fi
+
   local worktree_root="$(default_worktree_root)"
   local canonical_root="${worktree_root:A}"
   local -a worktree_paths worktree_heads worktree_branches worktree_kinds
-  local -a worktree_in_solo
+  local -a worktree_in_solo worktree_pr_state worktree_pr_number
   worktree_paths=()
   worktree_heads=()
   worktree_branches=()
   worktree_kinds=()
   worktree_in_solo=()
+  worktree_pr_state=()
+  worktree_pr_number=()
 
   local token=""
   local current_path=""
@@ -1494,8 +1712,13 @@ manage_worktrees() {
   print
   print -r -- "  ${B}${main_path:t}${R} ${D}${DOT}${R} ${D}${#worktree_paths} worktree(s)${R}"
   print
-  printf "  %s%2s  %-28s  %-9s  %-4s  %s%s\n" \
-    "$D" "#" "BRANCH" "TYPE" "SOLO" "PATH" "$R"
+  if [[ -n "$pr_rows" ]]; then
+    printf "  %s%2s  %-28s  %-9s  %-4s  %-7s  %s%s\n" \
+      "$D" "#" "BRANCH" "TYPE" "SOLO" "PR" "PATH" "$R"
+  else
+    printf "  %s%2s  %-28s  %-9s  %-4s  %s%s\n" \
+      "$D" "#" "BRANCH" "TYPE" "SOLO" "PATH" "$R"
+  fi
 
   for (( index = 1; index <= ${#worktree_paths}; ++index )); do
     actual_path="${worktree_paths[$index]}"
@@ -1533,14 +1756,39 @@ manage_worktrees() {
       solo_mark="${YLW}${MARK_BAD}${R}"
     fi
 
+    local pr_entry="" pr_state="" pr_number="" pr_label="" pr_color=""
+    if pr_entry="$(pull_request_for "$pr_rows" "${worktree_branches[$index]}")"; then
+      pr_state="${pr_entry%%$'\t'*}"
+      pr_number="${pr_entry##*$'\t'}"
+      local pr_style=""
+      pr_style="$(pull_request_style "$pr_state")"
+      pr_label="${pr_style%%$'\t'*}"
+      pr_color="${pr_style##*$'\t'}"
+    else
+      pr_label="-"
+      pr_color="$D"
+    fi
+    worktree_pr_state+=("$pr_state")
+    worktree_pr_number+=("$pr_number")
+
     # Colour codes stay in their own printf arguments so the %-Ns widths are
     # measured against the plain text and the columns still line up.
-    printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%s%s\n" \
-      "$D" "$index" "$R" \
-      "$B" "${worktree_branches[$index]}" "$R" \
-      "$kind_color" "$kind" "$R" \
-      "$solo_mark" \
-      "$D" "$(tilde "$actual_path")" "$R"
+    if [[ -n "$pr_rows" ]]; then
+      printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%-7s%s  %s%s%s\n" \
+        "$D" "$index" "$R" \
+        "$B" "${worktree_branches[$index]}" "$R" \
+        "$kind_color" "$kind" "$R" \
+        "$solo_mark" \
+        "$pr_color" "$pr_label" "$R" \
+        "$D" "$(tilde "$actual_path")" "$R"
+    else
+      printf "  %s%2d%s  %s%-28s%s  %s%-9s%s  %s     %s%s%s\n" \
+        "$D" "$index" "$R" \
+        "$B" "${worktree_branches[$index]}" "$R" \
+        "$kind_color" "$kind" "$R" \
+        "$solo_mark" \
+        "$D" "$(tilde "$actual_path")" "$R"
+    fi
   done
 
   local -a missing_from_solo
@@ -1550,6 +1798,25 @@ manage_worktrees() {
   if (( ${#missing_from_solo} > 0 )); then
     print -r -- "  ${YLW}${MARK_BAD}${R} ${D}${#missing_from_solo} not in Solo ${EM} select one to add it${R}"
     print
+  fi
+
+  # The whole point of the PR column is spotting finished work, so say how much
+  # of it there is instead of making it something to scan for.
+  if [[ -n "$pr_rows" ]]; then
+    local -i merged_count=0
+    local -i scan=0
+    for (( scan = 1; scan <= ${#worktree_paths}; ++scan )); do
+      # A merged PR on the main worktree's branch is routine and says nothing
+      # about removing anything, so it must not be counted as finished work.
+      [[ "${worktree_kinds[$scan]}" != "main" ]] || continue
+      [[ "${worktree_pr_state[$scan]:-}" == "MERGED" ]] || continue
+      (( ++merged_count ))
+    done
+
+    if (( merged_count > 0 )); then
+      print -r -- "  ${MAG}${MARK_OK}${R} ${D}${merged_count} merged ${EM} done with, safe to remove${R}"
+      print
+    fi
   fi
 
   local selection=""
@@ -1592,6 +1859,12 @@ manage_worktrees() {
     field "Solo" "${GRN}${MARK_OK}${R} yes"
   else
     field "Solo" "${YLW}${MARK_BAD}${R} no"
+  fi
+  local selected_pr_state="${worktree_pr_state[$selected_index]:-}"
+  if [[ -n "$selected_pr_state" ]]; then
+    local selected_style=""
+    selected_style="$(pull_request_style "$selected_pr_state")"
+    field "PR" "${selected_style##*$'\t'}#${worktree_pr_number[$selected_index]} ${selected_style%%$'\t'*}${R}"
   fi
   print
   local action=""
